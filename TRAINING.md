@@ -34,6 +34,56 @@ model_kind = gbr
 features   = area_cm2, height_cm, area_x_height
 ```
 
+## Modelltyp
+
+Unser Volumenmodell bekommt keine Bilder mehr direkt als Input. Die Bildmodelle
+arbeiten vorher und liefern Messwerte. Das eigene Modell sieht am Ende nur
+tabellarische Daten:
+
+```text
+area_cm2 = 45
+height_cm = 3.2
+area_x_height = 144
+```
+
+Eine Trainingszeile sieht vereinfacht so aus:
+
+| Flaeche | Hoehe | Flaeche x Hoehe | echtes Volumen |
+|---:|---:|---:|---:|
+| 45 cm2 | 3.2 cm | 144 | 90 ml |
+| 80 cm2 | 2.1 cm | 168 | 120 ml |
+
+Das ist **Supervised Learning**, weil fuer jedes Trainingsbeispiel das richtige
+Ziel bekannt ist: das gemessene Volumen. Es ist **Regression**, weil das Modell
+eine fortlaufende Zahl vorhersagt, nicht eine Klasse.
+
+Aktuell nutzen wir einen `GradientBoostingRegressor`. Das ist ein klassisches
+tabellarisches ML-Modell aus vielen kleinen Entscheidungsbaeumen. Ein Baum stellt
+einfache Wenn-dann-Fragen, zum Beispiel:
+
+```text
+Wenn area_cm2 > 50
+und height_cm > 2.5
+dann ist das Volumen eher groesser.
+```
+
+Ein einzelner Baum waere oft zu simpel. Gradient Boosting kombiniert viele kleine
+Baeume nacheinander, sodass Fehler schrittweise korrigiert werden und am Ende
+eine stabilere Volumenschaetzung entsteht.
+
+Wir trainieren dafuer kein neuronales Netz. Ein neuronales Netz waere eher
+sinnvoll, wenn es direkt aus Bildern lernen sollte und sehr viele gelabelte
+Beispiele vorhanden waeren. Unser Datensatz ist kleiner, aber die Messwerte sind
+fachlich stark: Flaeche, Hoehe und gemessenes Volumen. Deshalb ist ein
+klassisches tabellarisches Regressionsmodell hier passender, stabiler und besser
+erklaerbar.
+
+Kurz gesagt:
+
+```text
+Bild -> FastSAM/CLIP -> Flaeche/Hoehe -> kleines Regressionsmodell -> Volumen
+```
+
 ## Nutrition5k
 
 Nutrition5k wird nicht fuer Volumentraining verwendet. Es fehlen Seitenhoehe und
