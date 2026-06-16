@@ -220,13 +220,63 @@ class FoodSegmenter:
         plate_lab = np.median(lab[ring_bool], axis=0)
 
         dist = np.linalg.norm(lab.astype(np.float32) - plate_lab, axis=2)
-        thresh = max(18.0, float(np.percentile(dist[interior_mask], 75)))
-        food = (dist > thresh) & interior_mask
+        interior_dist = dist[interior_mask]
+        p75 = float(np.percentile(interior_dist, 75))
+        p95 = float(np.percentile(interior_dist, 95))
+        # On clean white/table backgrounds the useful signal may be a very subtle
+        # shadow or colour change. Keep the old robust threshold for busy scenes,
+        # but lower it when the whole image is low-contrast.
+        if p75 < 4.0 and p95 < 35.0:
+            thresh = 6.0
+        else:
+            thresh = max(18.0, p75)
+        food = (dist >= thresh) & interior_mask
         food = cv2.morphologyEx(food.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         food = cv2.morphologyEx(food, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
 
         n, labels = cv2.connectedComponents(food)
-        return [labels == i for i in range(1, n)]
+        masks = [labels == i for i in range(1, n)]
+
+        # Low-contrast scenes (e.g. pale food on a white table) may have almost no
+        # colour distance. Add edge-closed contours as a general fallback instead
+        # of exposing background-specific switches to the user.
+        masks.extend(self._edge_components(image_bgr, interior_mask))
+        return masks
+
+    @staticmethod
+    def _edge_components(image_bgr: np.ndarray, interior_mask: np.ndarray) -> list[np.ndarray]:
+        """Return filled contours from image edges.
+
+        This complements colour-contrast segmentation for neutral backgrounds and
+        pale foods. It is intentionally conservative: tiny texture edges and
+        frame-sized contours are filtered by area later in ``segment``.
+        """
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Equalise locally so subtle shadows/rims survive on bright backgrounds.
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        med = float(np.median(gray[interior_mask]))
+        lo = int(max(0, 0.66 * med))
+        hi = int(min(255, 1.33 * med))
+        edges = cv2.Canny(gray, lo, max(hi, lo + 20))
+        edges = edges & interior_mask.astype(np.uint8) * 255
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        masks: list[np.ndarray] = []
+        h, w = gray.shape
+        ref_area = max(1, int(interior_mask.sum()))
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 0.001 * ref_area or area > 0.90 * ref_area:
+                continue
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(mask, [cnt], -1, 255, thickness=-1)
+            masks.append(mask.astype(bool) & interior_mask)
+        return masks
 
     @staticmethod
     def _suppress_overlaps(instances: list[InstanceMask], iou_thresh: float = 0.85) -> list[InstanceMask]:

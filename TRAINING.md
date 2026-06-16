@@ -1,245 +1,103 @@
-# Training — wo, womit und wie
+# Training
 
-Dieses Dokument beantwortet *eine* Frage so konkret wie möglich:
-**„Wo und wie wird das Machine-Learning-Modell trainiert?"**
+Dieses Projekt trainiert nur die Mengenlogik, nicht die Bild-Basismodelle.
 
-Wenn dich der Code interessiert, findest du am Ende eine Liste der relevanten
-Dateien. Wenn du nur verstehen willst, was passiert, lies die ersten Abschnitte.
+| Baustein | Quelle | Wird selbst trainiert? |
+|---|---|---:|
+| Segmentierung | FastSAM | nein |
+| Food Recognition | CLIP | nein |
+| Volumenmodell | ECUSTFD-Features | ja |
+| Gramm-Fallback | Nutrition5k-Priors | kalibriert, nicht als Bildmodell trainiert |
 
----
+## Volumentraining
 
-## 1. Was wir überhaupt trainieren
+Das echte Volumenmodell braucht eine Flaeche aus dem Top-Bild und eine Hoehe aus
+dem Seitenbild:
 
-Drei der vier ML-Bausteine in dieser App sind **vortrainierte** Modelle aus dem
-Internet — wir trainieren sie *nicht* selbst, weil das ohne GPU und ohne riesige
-Bilddatensätze unrealistisch wäre:
-
-| Baustein | Modell | Trainiert von |
-|---|---|---|
-| Segmentierung (wo ist das Essen?) | FastSAM | Ultralytics (vortrainiert) |
-| Erkennung (welches Essen?) | CLIP | OpenAI (vortrainiert) |
-| Tiefenschätzung (optional) | Depth Anything V2 | DepthAnything-Team (vortrainiert) |
-
-**Wir trainieren genau einen Baustein selbst**: das **Portions-/Volumen-Modell**.
-Es bekommt zwei Zahlen pro Speise (Fläche und Höhe, beide in Zentimetern) und
-soll daraus das Volumen in Millilitern vorhersagen. Aus dem Volumen wird über
-eine Nährwerttabelle die Masse, daraus die Kalorien und Makronährstoffe.
-
-Konzeptuell:
-
-```
-   Eingabe:  Fläche [cm²]   Höhe [cm]      ←  aus dem Foto gemessen
-                  ↓               ↓
-              ┌───────────────────────┐
-              │   trainiertes Modell  │   ←  HIER findet das Training statt
-              └───────────────────────┘
-                          ↓
-   Ausgabe:           Volumen [mL]        →  × Dichte → Masse → Kalorien & Makros
+```text
+area_cm2, height_cm, area_cm2 * height_cm -> volume_ml
 ```
 
----
+ECUSTFD ist dafuer der passende Datensatz, weil er Top-View, Side-View,
+metrische Referenz, gemessenes Gewicht und gemessenes Volumen enthaelt.
 
-## 2. Woher die Trainingsdaten kommen
+Die App laedt standardmaessig:
 
-Wir benutzen **zwei** öffentliche Datensätze, kombiniert:
+```text
+artifacts/volume_model_trained.joblib
+```
 
-### Nutrition5k (Hauptdatensatz, neu hinzugekommen)
-[Thames et al., CVPR 2021](https://arxiv.org/abs/2103.03375). Google's Cafeteria-Datensatz:
-~5000 echte Mahlzeiten, jede Zutat einzeln gewogen, mit Kalorien und Makros.
-Wir laden ein **kuratiertes Subset** (439 Bilder, ~162 MB) — nur Gerichte mit
-**einer Standard-Zutat** (apple, pizza, bacon, broccoli, chicken, rice, …) und
-verfügbarem Top-Down-Foto. Lizenz: CC BY 4.0.
+Aktuelles Deployment-Modell:
+
+```text
+model_kind = gbr
+features   = area_cm2, height_cm, area_x_height
+```
+
+## Nutrition5k
+
+Nutrition5k wird nicht fuer Volumentraining verwendet. Es fehlen Seitenhoehe und
+Volumen-Ground-Truth. Der Datensatz ist trotzdem nuetzlich, weil er Top-Down-
+Bilder und gewogene Lebensmittel enthaelt.
+
+Wir nutzen ihn fuer den Fallback:
+
+```text
+mass_g = mass_per_cm2[class] * area_cm2
+```
+
+`foodvol.training.derive_n5k_mass_priors(...)` erzeugt robuste Median-Priors pro
+Klasse. Die Tests vergleichen diese Priors mit
+`data/n5k_meta/n5k_class_priors.json`, damit die Fallback-Grammwerte
+reproduzierbar bleiben.
+
+## Training ausfuehren
+
+Empfohlen:
 
 ```bash
-python data/download_nutrition5k.py
+jupyter lab notebooks/01_training.ipynb
 ```
 
-Daraus berechnen wir pro Klasse den **`mass_per_cm2`**-Faktor — die typische
-Grammzahl pro Quadratzentimeter Fußabdruck. Beispiel:
-```
-apple:          3,69 g/cm²    (kompakter)
-chicken_breast: 3,93 g/cm²
-pizza:          1,66 g/cm²    (flach)
-bacon:          0,70 g/cm²    (dünn)
-```
-Das macht den Volumen-Umweg überflüssig: `Masse = mass_per_cm2 × area_cm2`,
-direkt aus dem Foto.
-
-### ECUSTFD (sekundär, für die Volumen-Pipeline)
-[Liang & Li, 2017](https://arxiv.org/abs/1705.07632). 145 Speise-Portionen, jede
-gewogen plus per Wasserverdrängung volumetrisch gemessen. Enthält nur 19 Klassen,
-darunter manche chinesische Spezialitäten (litchi, mooncake, sachima), aber auch
-die Standards apple/banana/orange/tomato.
-
-```
-145 Portionen × { Foto von oben + Foto von der Seite + 1-Yuan-Münze als Maßstab + Gewicht + Volumen }
-```
-
-Beispielzeile aus den extrahierten Features
-(siehe [artifacts/ecustfd_features.csv](artifacts/ecustfd_features.csv)):
-
-```
-portion_id  food_type  area_cm2  height_cm  volume_ml  weight_g
-apple001    apple      72.2      7.7        310.0      244.5
-banana003   banana     94.7      3.2        150.0      149.8
-```
-
-Aus jedem **Top-Foto** rechnen wir per Münzen-Maßstab die Fläche in Quadrat­
-zentimetern aus; aus jedem **Side-Foto** die Höhe in Zentimetern. Das gewogene
-Volumen ist das **Trainingsziel**.
-
-Wichtig zu wissen: ECUSTFD enthält nur **rundes Obst und Snacks** (apple,
-banana, bread, bun, doughnut, egg, grape, lemon, litchi, mango, mooncake,
-orange, peach, pear, plum, kiwi, sachima, tomato). **Keine Pizza, keinen Burger,
-keine Suppe.** Für solche Gerichte greift die App auf von Hand geschätzte
-Klassen-Priors zurück (siehe Abschnitt 6), bis eigene Daten gesammelt werden.
-
----
-
-## 3. Wo das Training konkret im Code passiert
-
-Es gibt zwei Stellen, an denen wir ein Modell trainieren — eine einfache und
-eine ausführliche:
-
-### 3a) Einfaches Training (in [`foodvol/volume.py`](foodvol/volume.py))
-
-Die Methode `VolumeEstimator.fit(areas, heights, volumes_ml, model_kind=...)`
-lernt das Modell. Für die **ausgelieferte** Variante `proportional` ist das
-buchstäblich eine Zeile Mathematik:
+Oder programmgesteuert:
 
 ```python
-# foodvol/volume.py, in VolumeEstimator.fit(..., model_kind="proportional")
-ah = areas * heights
-self.shape_factor = float(np.sum(ah * volumes_ml) / np.sum(ah * ah))
+from foodvol import config, training
+
+df = training.load_ecustfd_features()
+leaderboard = training.score_volume_models(df)
+estimator = training.fit_final_volume_model(
+    df,
+    metrics={"leaderboard": leaderboard.to_dict(orient="records")},
+    save_path=config.VOLUME_MODEL_PATH,
+)
 ```
 
-Das ist die geschlossene Lösung der linearen Regression durch den Ursprung —
-Schul­mathematik. Das gelernte Ergebnis ist eine einzige Zahl `k ≈ 0,51`,
-gespeichert in [artifacts/volume_regressor.joblib](artifacts/volume_regressor.joblib).
-Die App nutzt sie als robusten Default für unbekannte Speiseklassen.
+Danach nutzt die App automatisch das gespeicherte Artefakt.
 
-### 3b) Ausführliches Training ([`notebooks/01_training.ipynb`](notebooks/01_training.ipynb))
+## Ergebnisse interpretieren
 
-Das richtige ML-Trainings-Notebook mit allem Drum und Dran:
+Letzter reproduzierter Lauf:
 
-| Zelle | Was passiert |
-|---|---|
-| 1 | Features laden ([artifacts/ecustfd_features_extended.csv](artifacts/ecustfd_features_extended.csv)) |
-| 2 | **Train/Validation/Test-Split** (70 / 15 / 15), stratifiziert nach Speisetyp |
-| 3 | Zwei Feature-Sets vorbereiten: nur Geometrie vs. Geometrie + Form-Deskriptoren |
-| 4 | **6 Modellfamilien** + Hyperparameter-Raster definieren: Ridge, Lasso, Huber, Random Forest, Gradient Boosting, MLP |
-| 5 | **GridSearchCV** über alle Modelle und Feature-Sets — sucht die besten Hyperparameter |
-| 6 | Vergleichs-Diagramm aller Modelle |
-| 7 | Gewinner auswählen |
-| 8 | **Lernkurve** — bringen mehr Daten was? |
-| 9 | **Permutation-Importance** — welches Feature trägt das meiste Signal? |
-| 10 | **Einmalige Test-Set-Evaluation** mit dem Gewinner — die ehrliche Zahl |
-| 11 | Modell speichern unter [artifacts/volume_model_trained.joblib](artifacts/volume_model_trained.joblib) |
+| Split | MAPE | Interpretation |
+|---|---:|---|
+| KFold | 19.1 % | Performance auf zufaelligen, aehnlichen Portionen |
+| GroupKFold by food type | 26.2 % | strengere Schaetzung fuer neue Food-Klassen |
 
-Wenn man das Notebook ausführt (Kernel „Python (ml4b-foodvol)", *Run All*),
-trainiert es das Modell von Grund auf neu. Die letzte Lauf-Bestzahl:
+Das Training dauert nur kurz, weil die Bildverarbeitung vorher in gecachte
+Features geschrieben wird. Das Problem ist daher nicht zu wenig Trainingszeit,
+sondern zu wenig passende Ground-Truth-Daten fuer eure Zielgerichte.
 
-```
-Gewinner:   GradientBoosting (base features)
-            Hyperparameter: learning_rate=0.03, max_depth=2, n_estimators=200
-Validation: MAPE 13,8 %   |  R² 0,93
-Test-Set:   MAPE 19,4 %   |  R² 0,84
-```
+## Was das Modell besser macht
 
-Vergleich: das einfache Ein-Parameter-Modell aus 3a) kommt auf MAPE 24 %.
-Das ausführliche Training bringt also einen messbaren Genauigkeits­gewinn.
+Mehr Daten helfen mehr als ein groesseres Modell. Der beste Ausbaupfad:
 
----
+1. Zielgerichte definieren.
+2. Pro Portion Top- und Seitenfoto aufnehmen.
+3. Gewicht mit Kuechenwaage erfassen.
+4. Wenn moeglich Volumen messen oder standardisiert ableiten.
+5. Daten in dieselbe Feature-Struktur wie ECUSTFD bringen.
+6. `notebooks/01_training.ipynb` erneut ausfuehren.
 
-## 4. Wie wir das Training bewerten
-
-Drei Methoden, in steigender Strenge:
-
-### 4a) 5-fache Kreuzvalidierung (Notebook 00, Zelle 9)
-
-Die Daten werden in 5 gleich große Teile geschnitten. Fünfmal: vier davon zum
-Trainieren, der fünfte zum Testen. Ergebnis: jeder Datenpunkt war einmal Test­
-punkt → ehrlicher Out-of-Sample-Fehler.
-
-### 4b) Train / Validation / Test (Notebook 01)
-
-* **Train (70 %)** → Modell lernen
-* **Validation (15 %)** → Hyperparameter wählen
-* **Test (15 %)** → einmalige finale Evaluierung. **Nicht** zum Tunen verwendet.
-
-Diese Trennung ist wichtig: nur so ist die finale Zahl eine ehrliche Schätzung,
-wie gut das Modell auf *neuen, ungesehenen* Daten arbeitet.
-
-### 4c) Metriken
-
-* **MAPE** — Mean Absolute Percentage Error, der mittlere prozentuale Fehler
-* **MAE** — Mean Absolute Error in mL bzw. g
-* **R²** — Bestimmtheitsmaß (1,0 = perfekt, 0 = nur der Mittelwert wäre genauso gut)
-
-Code: [`foodvol/volume.py`](foodvol/volume.py) → `evaluate()`.
-
----
-
-## 5. Wie ich das Training selbst ausführe
-
-Voraussetzung: Setup wie im README. Dann:
-
-```bash
-# Umgebung aktivieren (Linux/macOS)
-source .venv/bin/activate
-
-# Datensatz herunterladen (~125 MB, einmalig)
-python data/download_ecustfd.py
-
-# Einfaches Training (10 Sekunden — eine Zelle im Notebook)
-jupyter lab notebooks/00_feasibility.ipynb     # Zelle 16 ausführen
-
-# Vollständiges Training mit Hyperparameter-Tuning (~3 Minuten)
-jupyter lab notebooks/01_training.ipynb        # "Run All"
-```
-
-Nach dem Training liegen die Modelle hier:
-
-```
-artifacts/volume_regressor.joblib        # 1-Parameter-Modell (Default der App)
-artifacts/volume_model_trained.joblib    # Gradient-Boosting-Modell (genauer)
-```
-
----
-
-## 6. Was wir *nicht* aus Daten lernen (ehrlich)
-
-Für Speisen, die **nicht** in ECUSTFD vorkommen (Pizza, Burger, Suppe, Salat,
-Pasta, …), kennt das trainierte Modell die typische Form nicht. Wir greifen dort
-auf **handgeschätzte Klassen-Priors** aus
-[`foodvol/data/nutrition_db.csv`](foodvol/data/nutrition_db.csv) zurück:
-
-```csv
-class,density_g_per_ml,kcal_per_100g,...,typical_height_cm,shape_factor
-pizza,0.70,270,...,1.5,0.9
-hamburger,0.90,250,...,5.5,0.75
-soup,1.00,50,...,3.5,1.0
-```
-
-`typical_height_cm` und `shape_factor` sind *plausible Schätzwerte*, keine aus
-Daten gelernten Größen. Für eine produktreife Lösung müssten diese Klassen mit
-echten gewogenen Fotos trainiert werden — dafür ist die Pipeline vorbereitet
-([`foodvol/benchmark.py`](foodvol/benchmark.py) → `fit_final(df, ...)`):
-einfach eigene Datenpunkte ins DataFrame anhängen und das Training erneut
-ausführen.
-
----
-
-## 7. Datei-Übersicht (für Lesende, die in den Code wollen)
-
-| Datei | Rolle |
-|---|---|
-| [`data/download_ecustfd.py`](data/download_ecustfd.py) | lädt ECUSTFD herunter |
-| [`foodvol/datasets.py`](foodvol/datasets.py) | liest ECUSTFD ein (Bilder, Boxen, GT) |
-| [`foodvol/benchmark.py`](foodvol/benchmark.py) | **extrahiert Features** aus den Fotos (`extract_features`, `extract_features_extended`) |
-| [`foodvol/volume.py`](foodvol/volume.py) | **trainiert** + speichert das Modell (`VolumeEstimator.fit/save/load`) |
-| [`notebooks/00_feasibility.ipynb`](notebooks/00_feasibility.ipynb) | einfaches Training + Baseline |
-| [`notebooks/01_training.ipynb`](notebooks/01_training.ipynb) | **vollständiger Trainings-Workflow mit Split, Tuning, Test-Eval** |
-| [`artifacts/ecustfd_features.csv`](artifacts/ecustfd_features.csv) | gecachte Trainings-Features |
-| [`artifacts/volume_regressor.joblib`](artifacts/volume_regressor.joblib) | trainiertes 1-Parameter-Modell (ausgeliefert) |
-| [`artifacts/volume_model_trained.joblib`](artifacts/volume_model_trained.joblib) | trainiertes Gradient-Boosting-Modell |
+Nutrition5k verbessert den Gramm-Fallback. Fuer echtes Volumen ersetzt es keinen
+Top-/Side-Datensatz.

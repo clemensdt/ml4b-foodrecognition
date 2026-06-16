@@ -1,11 +1,10 @@
-"""Streamlit demo: estimate food mass, calories and macros from plate photos or a video.
+"""Streamlit demo: estimate food volume, mass, calories and macros from photos.
 
 Run with::
 
     streamlit run app.py
 
-The user provides either two photos (top-down + optional side) or a short video that
-pans around the plate, and enters the plate diameter. The app runs the
+The user provides a top-down photo and optionally a side photo. The app runs the
 :class:`foodvol.pipeline.FoodVolumePipeline` and shows per-item mass / calories /
 macros with an annotated overlay.
 """
@@ -24,6 +23,18 @@ st.set_page_config(page_title="Food Volume & Calorie Estimator", page_icon="🍽
 # Distinct overlay colours (BGR) cycled per detected item.
 _PALETTE = [(60, 60, 255), (60, 200, 60), (255, 160, 0), (200, 60, 200),
             (0, 200, 200), (160, 120, 60), (60, 160, 255)]
+
+FOOD_FILTERS = {
+    "Tolerant": 0.0,
+    "Balanced": 0.02,
+    "Strict": 0.05,
+}
+
+SCALE_MODES = {
+    "Auto": "auto",
+    "Food-size prior": "class_prior",
+    "Metric reference": "metric_reference",
+}
 
 
 @st.cache_resource(show_spinner="Loading models (first run downloads weights)…")
@@ -57,30 +68,40 @@ def _overlay(top_bgr: np.ndarray, result: PlateEstimate) -> np.ndarray:
 
 # --- Sidebar controls ----------------------------------------------------------
 st.sidebar.header("Settings")
-min_conf = st.sidebar.slider(
-    "Min. classification confidence", 0.0, 0.9, 0.0, 0.05,
-    help="Drop recognitions with CLIP score below this. 0 = keep all.",
+segmentation_preset = st.sidebar.segmented_control(
+    "Detection detail",
+    options=["Conservative", "Balanced", "Sensitive"],
+    default="Balanced",
+    help="Sensitive keeps smaller/subtler regions; Conservative suppresses clutter.",
+)
+food_filter_label = st.sidebar.segmented_control(
+    "Food filter",
+    options=list(FOOD_FILTERS),
+    default="Balanced",
+    help="Tolerant keeps more candidates; Strict removes more uncertain regions.",
+)
+scale_label = st.sidebar.selectbox(
+    "Scale",
+    options=list(SCALE_MODES),
+    index=0,
+    help="Auto uses a metric reference if visible, otherwise food-size priors.",
 )
 chessboard_cm = st.sidebar.number_input(
-    "Chessboard square size (cm)", min_value=0.5, max_value=10.0,
+    "Reference square (cm)", min_value=0.5, max_value=10.0,
     value=2.0, step=0.1,
-    help="If a chessboard calibration pattern is visible in the photo, the app "
-         "uses it as the metric scale automatically. Set this to the real-world "
-         "edge length of one square on your printed board.",
+    help="Used only when a chessboard/reference grid is visible.",
 )
 st.sidebar.caption(f"Compute device: **{config.get_device()}**")
 st.sidebar.caption(
-    "**How the scale is found**: the app first looks for a chessboard pattern. "
-    "If one is in the photo, the size measurement is metric and accurate. If not, "
-    "the scale is inferred from the recognised food class — that's less reliable "
-    "(every serving gets treated as a typical one)."
+    "Use **Sensitive** for small or low-contrast food, **Strict** when the table or "
+    "background creates false positives. **Auto** scale works with or without a visible reference."
 )
 
 # --- Header --------------------------------------------------------------------
 st.title("🍽️ Food Volume & Calorie Estimator")
 st.write(
-    "Upload a top-down photo of your food. The app recognises the dish and "
-    "estimates its **mass, calories and macros**."
+    "Upload a top-down photo of your food, optionally with a side photo for "
+    "height. The app estimates **volume, mass, calories and macros**."
 )
 
 # --- Input ---------------------------------------------------------------------
@@ -99,7 +120,13 @@ if side_file is not None:
 if top_bgr is not None and st.button("Estimate", type="primary"):
     pipe = get_pipeline()
     with st.spinner("Analysing image…"):
-        result = pipe.estimate(top_bgr, side_image=side_bgr, min_confidence=min_conf)
+        result = pipe.estimate(
+            top_bgr,
+            side_image=side_bgr,
+            min_confidence=FOOD_FILTERS[food_filter_label],
+            segmentation_preset=segmentation_preset.lower(),
+            scale_mode=SCALE_MODES[scale_label],
+        )
 
     if not result.items:
         st.warning("No food recognised in the image. Try a clearer photo.")
@@ -131,9 +158,12 @@ if top_bgr is not None and st.button("Estimate", type="primary"):
         "Mass conf": f"{it.quantity_confidence:.0%}",
         "Also considered": _alts(it),
         "Area (cm²)": round(it.area_cm2, 1),
+        "Height (cm)": None if np.isnan(it.height_cm) else round(it.height_cm, 1),
+        "Volume (mL)": round(it.volume_ml, 0),
         "Mass (g)": round(it.mass_g, 0),
         "Plausible range": _range(it),
         "Scale": it.scale_source,
+        "Quantity source": it.mass_source,
         "Calories (kcal)": round(it.nutrition.kcal, 0),
         "Protein (g)": round(it.nutrition.protein_g, 1),
         "Carbs (g)": round(it.nutrition.carbs_g, 1),
@@ -151,9 +181,9 @@ if top_bgr is not None and st.button("Estimate", type="primary"):
     if any(it.nutrition.is_default for it in result.items):
         st.caption("⚠️ Some items used a generic nutrition fallback (class not in the table).")
     st.info(
-        "Estimates are approximate. Expect ~15–30 % mass error; accuracy is highest for a "
-        "single dish photographed top-down with a side view. The volume model was trained on "
-        "ECUSTFD (fruit/snacks) — collect target-domain data to improve it."
+        "Estimates are approximate. With a usable side photo, quantity comes from the "
+        "trained ECUSTFD volume model; without one, it falls back to per-class area-to-mass "
+        "priors. Target-domain weighed photos are still the main path to better accuracy."
     )
 elif top_bgr is None:
-    st.info("⬆️ Provide a top-down photo or a video to begin.")
+    st.info("⬆️ Provide a top-down photo to begin.")

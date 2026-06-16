@@ -355,8 +355,13 @@ def mass_error(df: pd.DataFrame, volume_pred_ml: np.ndarray, use_db_density: boo
     return evaluate(df["weight_g"].to_numpy(), mass_pred)
 
 
-def fit_final(df: pd.DataFrame, model_kind: str = "huber", save: bool = True) -> VolumeEstimator:
-    """Fit the estimator on all portions and (optionally) persist it for the app."""
+def fit_final(
+    df: pd.DataFrame,
+    model_kind: str = "huber",
+    save: bool = True,
+    path: Path = config.VOLUME_BASELINE_MODEL_PATH,
+) -> VolumeEstimator:
+    """Fit the legacy benchmark estimator and optionally persist it as baseline."""
     est = VolumeEstimator().fit(
         df["area_cm2"].to_numpy(), df["height_cm"].to_numpy(),
         df["volume_ml"].to_numpy(), model_kind=model_kind,
@@ -364,6 +369,6 @@ def fit_final(df: pd.DataFrame, model_kind: str = "huber", save: bool = True) ->
     cv = cross_validate(df, model_kind=model_kind)
     est.metrics = {f"cv_{k}": v for k, v in cv["trained"].items()}
     if save:
-        path = est.save()
+        path = est.save(path)
         print(f"Saved trained volume model to {path}")
     return est

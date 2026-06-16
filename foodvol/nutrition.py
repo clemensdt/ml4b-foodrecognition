@@ -1,8 +1,10 @@
-"""Stage F — nutrition lookup: class -> density and energy/macros -> mass & calories.
+"""Stage F — nutrition lookup: class -> density, energy/macros and portion priors.
 
 Reads the bundled :data:`~foodvol.config.NUTRITION_DB_PATH` table. The ``density``
-column converts an estimated **volume** (mL) into **mass** (g); the per-100 g energy
-and macro columns then convert mass into **calories** and **macronutrients**.
+column converts an estimated **volume** (mL) into **mass** (g). The
+``mass_per_cm2`` column is the explicit fallback when no side-view height exists.
+The per-100 g energy and macro columns then convert mass into **calories** and
+**macronutrients**.
 
 Lookups are normalised (lower-case, spaces/hyphens -> underscores) so they tolerate
 small label differences, and fall back to a documented generic value for unknown
@@ -18,8 +20,8 @@ from typing import Optional
 from . import config
 
 # Generic cooked-food fallback used when a class is not in the table. Portion priors
-# are intentionally None for the default — unknown classes fall back to the trained
-# class-agnostic volume regressor + the geometric height prior.
+# are intentionally None for the default; unknown classes get a generic area-mass
+# fallback unless a side-view height lets the volume model run.
 DEFAULT_NUTRITION = ("__default__", 0.90, 200.0, 8.0, 25.0, 8.0)
 
 

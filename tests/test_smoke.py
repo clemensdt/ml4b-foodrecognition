@@ -7,7 +7,8 @@ import pytest
 
 def test_all_modules_import():
     for mod in ["calibration", "segmentation", "classification", "depth", "recognition",
-                "volume", "nutrition", "pipeline", "datasets", "benchmark", "video", "config"]:
+                "volume", "portion", "nutrition", "training", "pipeline", "datasets",
+                "benchmark", "video", "config"]:
         importlib.import_module(f"foodvol.{mod}")
 
 

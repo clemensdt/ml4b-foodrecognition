@@ -8,7 +8,9 @@ own module and can be used in isolation:
     classification food class + confidence (drives the nutrition lookup)
     depth          monocular relative depth (optional height cue)
     volume         footprint area + height -> physical volume (the trained part)
+    portion        volume/mass decision rules used by app and notebooks
     nutrition      density + energy/macros table -> mass and calories
+    training       reusable ECUSTFD/Nutrition5k training workflow
     pipeline       wires the stages together end to end
 
 Heavy models (segmentation, classification, depth) are loaded lazily on first
@@ -24,7 +26,9 @@ __all__ = [
     "classification",
     "depth",
     "volume",
+    "portion",
     "nutrition",
+    "training",
     "pipeline",
     "config",
 ]

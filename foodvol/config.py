@@ -36,8 +36,9 @@ NUTRITION_DB_PATH = PACKAGE_DIR / "data" / "nutrition_db.csv"
 for _d in (DATA_DIR, MODELS_DIR, ARTIFACTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# Trained volume regressor written by the feasibility notebook / training script.
-VOLUME_MODEL_PATH = ARTIFACTS_DIR / "volume_regressor.joblib"
+# Trained volume regressor written by the training notebook.
+VOLUME_MODEL_PATH = ARTIFACTS_DIR / "volume_model_trained.joblib"
+VOLUME_BASELINE_MODEL_PATH = ARTIFACTS_DIR / "volume_regressor.joblib"
 
 
 # --- Compute device ------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Tests for pipeline helpers that don't require downloading models."""
 import numpy as np
 
-from foodvol.pipeline import FoodVolumePipeline
+from foodvol.pipeline import FoodVolumePipeline, _SideHeightProfile
 from foodvol.recognition import Recognition
 from foodvol.segmentation import _mask_to_instance
 
@@ -34,3 +34,30 @@ def test_suppress_nested_keeps_highest_score_and_drops_contained():
 
 def test_suppress_nested_empty():
     assert FoodVolumePipeline._suppress_nested([]) == []
+
+
+def test_height_for_item_uses_side_chessboard_scale():
+    profile = _SideHeightProfile(height_px=50, cm_per_px=0.1, scale_source="side_chessboard")
+    height, source = FoodVolumePipeline._height_for_item(profile, item_cm_per_px=0.2)
+    assert height == 5.0
+    assert source == "side_chessboard"
+
+
+def test_height_for_item_falls_back_to_item_scale():
+    profile = _SideHeightProfile(height_px=50, cm_per_px=None, scale_source="side_item_scale")
+    height, source = FoodVolumePipeline._height_for_item(profile, item_cm_per_px=0.2)
+    assert height == 10.0
+    assert source == "side_item_scale"
+
+
+def test_segmentation_presets_are_ordered():
+    conservative = FoodVolumePipeline._segmentation_config("conservative")
+    balanced = FoodVolumePipeline._segmentation_config("balanced")
+    sensitive = FoodVolumePipeline._segmentation_config("sensitive")
+
+    assert conservative["min_area_frac"] > balanced["min_area_frac"] > sensitive["min_area_frac"]
+    assert conservative["max_segments"] < balanced["max_segments"] < sensitive["max_segments"]
+
+
+def test_unknown_segmentation_preset_uses_balanced():
+    assert FoodVolumePipeline._segmentation_config("wat") == FoodVolumePipeline._segmentation_config("balanced")

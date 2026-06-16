@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -84,8 +84,53 @@ def volume_features(area_cm2: float, height_cm: float) -> np.ndarray:
     return np.array([area_cm2, height_cm, area_cm2 * height_cm], dtype=np.float64)
 
 
-def feature_matrix(areas: Sequence[float], heights: Sequence[float]) -> np.ndarray:
-    return np.vstack([volume_features(a, h) for a, h in zip(areas, heights)])
+def _feature_values(
+    area_cm2: float,
+    height_cm: float,
+    extra_features: Optional[Mapping[str, float]] = None,
+) -> dict[str, float]:
+    values = {
+        "area_cm2": float(area_cm2),
+        "height_cm": float(height_cm),
+        "area_x_height": float(area_cm2) * float(height_cm),
+    }
+    if extra_features:
+        values.update({k: float(v) for k, v in extra_features.items()})
+    return values
+
+
+def features_for_names(
+    area_cm2: float,
+    height_cm: float,
+    feature_names: Sequence[str] = FEATURE_NAMES,
+    extra_features: Optional[Mapping[str, float]] = None,
+) -> np.ndarray:
+    """Build one feature vector by name.
+
+    The app normally has only the base geometry. Training notebooks may include
+    extra descriptors, but the feature list must be stored with the artifact so
+    inference can reproduce the same column order.
+    """
+    values = _feature_values(area_cm2, height_cm, extra_features)
+    missing = [name for name in feature_names if name not in values]
+    if missing:
+        raise KeyError(f"missing volume feature(s): {', '.join(missing)}")
+    return np.array([values[name] for name in feature_names], dtype=np.float64)
+
+
+def feature_matrix(
+    areas: Sequence[float],
+    heights: Sequence[float],
+    feature_names: Sequence[str] = FEATURE_NAMES,
+    extra_features: Optional[Mapping[str, Sequence[float]]] = None,
+) -> np.ndarray:
+    rows = []
+    for idx, (area, height) in enumerate(zip(areas, heights)):
+        extra = None
+        if extra_features:
+            extra = {name: np.asarray(values)[idx] for name, values in extra_features.items()}
+        rows.append(features_for_names(area, height, feature_names, extra))
+    return np.vstack(rows)
 
 
 # --- estimator -----------------------------------------------------------------
@@ -96,11 +141,17 @@ class VolumeEstimator:
     ``volume = shape_factor * area * height``.
     """
 
-    def __init__(self, shape_factor: float = 0.5):
+    def __init__(
+        self,
+        shape_factor: float = 0.5,
+        feature_names: Sequence[str] = FEATURE_NAMES,
+    ):
         self.shape_factor = shape_factor
         self.model = None              # sklearn regressor once fitted (None for 'proportional')
         self.fitted = False            # True once fit() has run (model or learned shape factor)
         self.metrics: dict[str, float] = {}
+        self.feature_names = tuple(feature_names)
+        self.model_kind = "physics_fallback"
 
     # --- training ---
     def fit(
@@ -109,13 +160,17 @@ class VolumeEstimator:
         heights: Sequence[float],
         volumes_ml: Sequence[float],
         model_kind: str = "huber",
+        feature_names: Sequence[str] = FEATURE_NAMES,
+        extra_features: Optional[Mapping[str, Sequence[float]]] = None,
     ) -> "VolumeEstimator":
         """Fit ``volume = f(area, height)`` on measured ground-truth volumes."""
         from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import StandardScaler
 
-        X = feature_matrix(areas, heights)
+        self.feature_names = tuple(feature_names)
+        X = feature_matrix(areas, heights, self.feature_names, extra_features)
         y = np.asarray(volumes_ml, dtype=np.float64)
+        self.model_kind = model_kind
 
         if model_kind == "proportional":
             # Physics with a *learned* shape factor: volume = k * area * height.
@@ -128,10 +183,36 @@ class VolumeEstimator:
             return self
         if model_kind == "huber":
             from sklearn.linear_model import HuberRegressor
-            self.model = make_pipeline(StandardScaler(), HuberRegressor(max_iter=500))
+            self.model = make_pipeline(StandardScaler(), HuberRegressor(max_iter=1000))
+        elif model_kind == "ridge":
+            from sklearn.linear_model import Ridge
+            self.model = make_pipeline(StandardScaler(), Ridge(alpha=10.0))
         elif model_kind == "gbr":
+            from sklearn.ensemble import GradientBoostingRegressor
+            self.model = make_pipeline(
+                StandardScaler(),
+                GradientBoostingRegressor(
+                    learning_rate=0.03,
+                    max_depth=2,
+                    n_estimators=200,
+                    random_state=0,
+                ),
+            )
+        elif model_kind == "hist_gbr":
             from sklearn.ensemble import HistGradientBoostingRegressor
-            self.model = HistGradientBoostingRegressor(max_depth=3, max_iter=200)
+            self.model = HistGradientBoostingRegressor(
+                max_iter=200,
+                max_leaf_nodes=15,
+                l2_regularization=0.1,
+                random_state=0,
+            )
+        elif model_kind == "random_forest":
+            from sklearn.ensemble import RandomForestRegressor
+            self.model = RandomForestRegressor(
+                n_estimators=300,
+                min_samples_leaf=3,
+                random_state=0,
+            )
         elif model_kind == "linear":
             from sklearn.linear_model import LinearRegression
             self.model = make_pipeline(StandardScaler(), LinearRegression())
@@ -143,17 +224,38 @@ class VolumeEstimator:
         return self
 
     # --- inference ---
-    def predict_volume(self, area_cm2: float, height_cm: float) -> float:
+    def predict_volume(
+        self,
+        area_cm2: float,
+        height_cm: float,
+        extra_features: Optional[Mapping[str, float]] = None,
+    ) -> float:
         """Predict volume in mL for a single (area, height) pair."""
         if self.model is not None:
-            X = volume_features(area_cm2, height_cm).reshape(1, -1)
-            return float(max(0.0, self.model.predict(X)[0]))
+            try:
+                X = features_for_names(
+                    area_cm2, height_cm, self.feature_names, extra_features,
+                ).reshape(1, -1)
+                return float(max(0.0, self.model.predict(X)[0]))
+            except KeyError:
+                # Deployment should keep running if a research artifact needs
+                # features the live app cannot measure.
+                pass
         return float(self.shape_factor * area_cm2 * height_cm)
 
-    def predict_many(self, areas: Sequence[float], heights: Sequence[float]) -> np.ndarray:
+    def predict_many(
+        self,
+        areas: Sequence[float],
+        heights: Sequence[float],
+        extra_features: Optional[Mapping[str, Sequence[float]]] = None,
+    ) -> np.ndarray:
         if self.model is not None:
-            preds = self.model.predict(feature_matrix(areas, heights))
-            return np.clip(preds, 0.0, None)
+            try:
+                X = feature_matrix(areas, heights, self.feature_names, extra_features)
+                preds = self.model.predict(X)
+                return np.clip(preds, 0.0, None)
+            except KeyError:
+                pass
         return np.array([self.shape_factor * a * h for a, h in zip(areas, heights)])
 
     @property
@@ -165,8 +267,16 @@ class VolumeEstimator:
         import joblib
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"shape_factor": self.shape_factor, "model": self.model,
-                     "fitted": self.fitted, "metrics": self.metrics}, path)
+        joblib.dump({
+            "artifact_version": 2,
+            "kind": "foodvol.volume.VolumeEstimator",
+            "shape_factor": self.shape_factor,
+            "model": self.model,
+            "model_kind": self.model_kind,
+            "features": list(self.feature_names),
+            "fitted": self.fitted,
+            "metrics": self.metrics,
+        }, path)
         return path
 
     @classmethod
@@ -175,10 +285,17 @@ class VolumeEstimator:
         est = cls()
         try:
             blob = joblib.load(path)
+            if isinstance(blob, cls):
+                return blob
             est.shape_factor = blob.get("shape_factor", 0.5)
             est.model = blob.get("model")
             est.fitted = blob.get("fitted", est.model is not None)
+            est.feature_names = tuple(blob.get("features", blob.get("feature_names", FEATURE_NAMES)))
+            est.model_kind = blob.get("model_kind", blob.get("winner", "loaded_model"))
             est.metrics = blob.get("metrics", {})
+            for key in ("metrics_val", "metrics_test", "metrics_test_mass"):
+                if key in blob:
+                    est.metrics[key] = blob[key]
         except Exception as exc:
             print(f"[volume] could not load trained model ({exc}); using physics fallback.")
         return est

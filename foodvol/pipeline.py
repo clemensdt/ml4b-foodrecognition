@@ -1,19 +1,17 @@
-"""End-to-end orchestration: images + plate diameter -> per-item mass and calories.
+"""End-to-end orchestration: images -> per-item volume, mass and calories.
 
 Wires the stages together:
 
     top view  --calibrate--> scale --segment--> items --classify--> class
                                           |                    |
                                           +--> footprint area  +--> density/energy
-    side view --calibrate--> scale --segment--> food height
+    side view --segment--> food height --scale via chessboard or item scale
                                           |
               area + height --VolumeEstimator--> volume --x density--> mass --> calories
 
-Height handling: with a side view we measure the dominant food's height and apply it
-per item. This is exact for a single dish and an approximation for multi-item plates
-with very different heights (documented limitation); the rigorous per-portion
-evaluation lives in ``notebooks/00_feasibility.ipynb``. Without a side view, an
-optional monocular depth cue or a coarse area-based prior is used instead.
+Height handling: with a side view we measure the dominant food's height and use the
+trained :class:`foodvol.volume.VolumeEstimator`. Without a side view, the pipeline
+falls back to explicitly labelled area-to-mass priors from the nutrition table.
 """
 from __future__ import annotations
 
@@ -26,6 +24,7 @@ import numpy as np
 
 from . import config, nutrition
 from .nutrition import NutritionEstimate
+from .portion import area_mass_prior, estimate_quantity
 from .recognition import FoodRecognizer, Recognition
 from .segmentation import FoodSegmenter, InstanceMask
 from .volume import VolumeEstimator
@@ -33,7 +32,22 @@ from .volume import VolumeEstimator
 ImageInput = Union[str, Path, np.ndarray]
 
 MAX_SEGMENTS = 40        # cap how many regions the recogniser scores per image
-MAX_HEIGHT_CM = 12.0     # clamp per-item height to a physically plausible range
+MAX_HEIGHT_CM = 12.0     # clamp measured side-view height to a plausible range
+
+SEGMENTATION_PRESETS = {
+    "conservative": {"min_area_frac": 0.008, "max_area_frac": 0.80, "max_segments": 25},
+    "balanced": {"min_area_frac": 0.004, "max_area_frac": 0.92, "max_segments": 40},
+    "sensitive": {"min_area_frac": 0.0015, "max_area_frac": 0.97, "max_segments": 60},
+}
+
+
+@dataclass
+class _SideHeightProfile:
+    """Dominant side-view height before item-specific scaling."""
+
+    height_px: float
+    cm_per_px: Optional[float] = None
+    scale_source: str = "item_scale"
 
 
 @dataclass
@@ -48,10 +62,13 @@ class ItemEstimate:
     nutrition: NutritionEstimate
     mask: InstanceMask
     scale_source: str = "class_prior"        # 'class_prior' | 'chessboard' | 'reranked'
-    mass_source: str = "areal_density"       # 'areal_density' | 'clamped_min' | 'clamped_max'
+    height_source: str = "none"              # 'side_chessboard' | 'side_item_scale' | 'none'
+    mass_source: str = "area_mass_prior"     # 'volume_model:*' | 'area_mass_prior'
     cm_per_px: float = 0.0
     typical_mass_g: float = 0.0
     mass_range_g: tuple[float, float] = (0.0, 0.0)
+    raw_mass_g: float = 0.0
+    raw_volume_ml: float = 0.0
     quantity_confidence: float = 0.0         # 0..1, how trustworthy *the mass* is
     alternatives: list[tuple[str, float]] = field(default_factory=list)  # CLIP top-k
 
@@ -129,39 +146,75 @@ class FoodVolumePipeline:
         top_image: ImageInput,
         side_image: Optional[ImageInput] = None,
         min_confidence: float = 0.0,
+        segmentation_preset: str = "balanced",
+        scale_mode: str = "auto",
     ) -> PlateEstimate:
-        """Estimate per-item mass and calories — no metric reference required.
+        """Estimate per-item mass and calories.
 
         The pipeline runs in this order:
           1. Segment the image into region candidates (FastSAM).
           2. Recognise each candidate (CLIP) and drop non-food regions.
           3. **Self-calibrate per item**: convert pixels to centimetres using the
              recognised class's ``typical_long_cm`` from the nutrition table.
-          4. Apply class-specific shape factor + height (or the side view) to
-             compute volume → mass → calories & macros.
+          4. If a side view is provided, measure height and run the trained
+             volume model. Otherwise use the labelled area-to-mass fallback.
 
-        ``side_image`` is no longer used for plate calibration; it is still
-        accepted for compatibility but currently ignored.
+        ``segmentation_preset`` is one of ``conservative``, ``balanced`` or
+        ``sensitive``. ``scale_mode`` is ``auto``, ``class_prior`` or
+        ``metric_reference``.
         """
-        del side_image  # accepted for backward compatibility, not used yet
         top = _load_bgr(top_image)
+        side = _load_bgr(side_image) if side_image is not None else None
         result = PlateEstimate()
-        result.height_source = "class_prior"
+        result.height_source = "area_mass_prior"
+        seg = self._segmentation_config(segmentation_preset)
+        scale_mode = self._normalise_scale_mode(scale_mode)
 
         # 0. Opportunistic: detect a chessboard. If found, it gives a real cm/px
         #    independent of the recognised class — far more reliable than
         #    deriving the scale from class priors.
         from .chessboard import detect_scale as _detect_chessboard_scale
-        cb = _detect_chessboard_scale(top, square_cm=self.chessboard_square_cm)
+        cb = (_detect_chessboard_scale(top, square_cm=self.chessboard_square_cm)
+              if scale_mode != "class_prior" else None)
         if cb is not None:
             result.chessboard_scale_cm_per_px = cb.cm_per_px
             result.notes.append(
                 f"Chessboard detected ({cb.pattern[0]}×{cb.pattern[1]} corners, "
                 f"square = {cb.square_cm:.1f} cm) — using it as the metric scale."
             )
+        elif scale_mode == "metric_reference":
+            result.notes.append(
+                "No metric reference was detected; falling back to food-size priors."
+            )
+
+        side_profile = None
+        if side is not None:
+            side_cb = (_detect_chessboard_scale(side, square_cm=self.chessboard_square_cm)
+                       if scale_mode != "class_prior" else None)
+            side_profile = self._side_height_profile(side, side_cb, seg)
+            if side_cb is not None:
+                result.notes.append(
+                    f"Chessboard detected in side view — side height uses "
+                    f"{side_cb.cm_per_px:.4f} cm/px."
+                )
+            elif side_profile is not None:
+                result.notes.append(
+                    "Side view detected, but no side-view chessboard was found; "
+                    "height is scaled with each item's top-view scale."
+                )
+            else:
+                result.notes.append(
+                    "Side view was provided, but no usable side-view food region "
+                    "was found. Falling back to area-to-mass priors."
+                )
 
         # 1. Segment the whole frame; no plate-interior restriction.
-        segments = self.segmenter.segment(top, interior_mask=None)[:MAX_SEGMENTS]
+        segments = self.segmenter.segment(
+            top,
+            interior_mask=None,
+            min_area_frac=seg["min_area_frac"],
+            max_area_frac=seg["max_area_frac"],
+        )[:seg["max_segments"]]
         if not segments:
             result.notes.append("No distinct regions detected.")
             return result
@@ -179,30 +232,31 @@ class FoodVolumePipeline:
         # FastSAM emits the same object at several scales; collapse overlapping ones.
         kept = self._suppress_nested(candidates)
 
-        # 3 + 4. For each item: self-calibrate, predict mass, sanity-rerank, clamp.
+        # 3 + 4. For each item: self-calibrate, choose class, estimate quantity.
         for inst, rec in kept:
             # Try the top-1 class; if its plausible range can't contain the measurement,
             # re-evaluate the same area against every food candidate in CLIP's top-k
             # and prefer one whose plausible range *does* contain the raw estimate.
             chosen_label, chosen_info, cm_per_px, scale_src, area_cm2, raw_mass, was_reranked \
-                = self._pick_class_and_scale(inst, rec, cb)
+                = self._pick_class_and_scale(inst, rec, cb, scale_mode)
 
             info = chosen_info
             lo = info.mass_min_g if info.mass_min_g is not None else 0.0
             hi = info.mass_max_g if info.mass_max_g is not None else float("inf")
-            if raw_mass < lo:
-                mass_g, mass_src = lo, "clamped_min"
-            elif raw_mass > hi:
-                mass_g, mass_src = hi, "clamped_max"
-            else:
-                mass_g, mass_src = raw_mass, "areal_density"
-
-            volume_ml = (float(mass_g / info.density_g_per_ml)
-                         if info.density_g_per_ml else float("nan"))
+            height_cm, height_src = self._height_for_item(side_profile, cm_per_px)
+            qty = estimate_quantity(
+                info,
+                area_cm2,
+                self.volume,
+                height_cm=height_cm,
+                height_source=height_src,
+            )
+            if height_src != "none":
+                result.height_source = height_src
 
             # Quantity confidence: how trustworthy is *the mass*?
             q_conf = self._quantity_confidence(
-                clip_score=rec.score, raw_mass=raw_mass, lo=lo, hi=hi,
+                clip_score=rec.score, raw_mass=qty.raw_mass_g, lo=lo, hi=hi,
                 typical=info.typical_mass_g or (lo + hi) / 2 if hi != float("inf") else lo,
                 scale_src=scale_src,
                 was_reranked=was_reranked,
@@ -210,15 +264,18 @@ class FoodVolumePipeline:
 
             item = ItemEstimate(
                 food_class=chosen_label, confidence=rec.score, area_cm2=area_cm2,
-                height_cm=float("nan"), volume_ml=volume_ml,
-                nutrition=info.for_mass(mass_g), mask=inst,
+                height_cm=qty.height_cm, volume_ml=qty.volume_ml,
+                nutrition=info.for_mass(qty.mass_g), mask=inst,
                 alternatives=[(l, s) for l, s in rec.top if l != chosen_label][:3],
             )
             item.scale_source = "reranked" if was_reranked else scale_src
-            item.mass_source = mass_src
+            item.height_source = height_src
+            item.mass_source = qty.source
             item.cm_per_px = cm_per_px
             item.typical_mass_g = info.typical_mass_g or 0.0
             item.mass_range_g = (lo, hi if hi != float("inf") else 0.0)
+            item.raw_mass_g = qty.raw_mass_g
+            item.raw_volume_ml = qty.raw_volume_ml
             item.quantity_confidence = q_conf
             result.items.append(item)
 
@@ -227,10 +284,10 @@ class FoodVolumePipeline:
                     f"Top-1 class '{rec.label}' didn't fit the measured size; "
                     f"re-ranked to '{chosen_label}' from CLIP's alternatives."
                 )
-            if mass_src in ("clamped_min", "clamped_max"):
+            if qty.clamped:
                 result.notes.append(
-                    f"{chosen_label}: raw estimate {raw_mass:.0f} g was outside the "
-                    f"plausible range ({lo:.0f}-{hi:.0f} g); clamped to {mass_g:.0f} g."
+                    f"{chosen_label}: raw estimate {qty.raw_mass_g:.0f} g was outside the "
+                    f"plausible range ({lo:.0f}-{hi:.0f} g); clamped to {qty.mass_g:.0f} g."
                 )
 
         if not result.items:
@@ -247,6 +304,66 @@ class FoodVolumePipeline:
         return result
 
     @staticmethod
+    def _segmentation_config(preset: str) -> dict[str, float]:
+        """Return robust segmentation parameters for a user-facing preset."""
+        return SEGMENTATION_PRESETS.get(preset, SEGMENTATION_PRESETS["balanced"])
+
+    @staticmethod
+    def _normalise_scale_mode(scale_mode: str) -> str:
+        if scale_mode in {"auto", "class_prior", "metric_reference"}:
+            return scale_mode
+        return "auto"
+
+    def _side_height_profile(
+        self,
+        side_bgr: np.ndarray,
+        chessboard,
+        seg: dict[str, float],
+    ) -> Optional[_SideHeightProfile]:
+        """Measure the dominant side-view food height in pixels.
+
+        The side image is optional and usually contains one dish. We therefore use
+        the largest plausible food/object segment as the side silhouette. If a
+        chessboard is visible in the side view, its metric scale is attached here;
+        otherwise the item-specific top-view scale is applied later.
+        """
+        segments = self.segmenter.segment(
+            side_bgr,
+            interior_mask=None,
+            min_area_frac=max(0.001, seg["min_area_frac"] * 0.75),
+            max_area_frac=min(0.85, seg["max_area_frac"]),
+        )
+        if not segments:
+            return None
+        inst = max(segments[:int(seg["max_segments"])], key=lambda s: (s.bbox[3], s.area_px))
+        _, _, _, height_px = inst.bbox
+        if height_px <= 0:
+            return None
+        cm_per_px = chessboard.cm_per_px if chessboard is not None else None
+        scale_source = "side_chessboard" if chessboard is not None else "side_item_scale"
+        return _SideHeightProfile(
+            height_px=float(height_px),
+            cm_per_px=cm_per_px,
+            scale_source=scale_source,
+        )
+
+    @staticmethod
+    def _height_for_item(
+        side_profile: Optional[_SideHeightProfile],
+        item_cm_per_px: float,
+    ) -> tuple[Optional[float], str]:
+        if side_profile is None:
+            return None, "none"
+        scale = side_profile.cm_per_px
+        source = side_profile.scale_source
+        if scale is None:
+            if item_cm_per_px <= 0:
+                return None, "none"
+            scale = item_cm_per_px
+        height_cm = float(np.clip(side_profile.height_px * scale, 0.3, MAX_HEIGHT_CM))
+        return height_cm, source
+
+    @staticmethod
     def _per_item_scale(inst: "InstanceMask", info) -> tuple[float, str]:
         """Return (cm/px, source) for a single item, *class-only* fallback.
 
@@ -258,7 +375,7 @@ class FoodVolumePipeline:
             return float(info.typical_long_cm / long_side_px), "class_prior"
         return float(10.0 / max(long_side_px, 1)), "fallback"
 
-    def _pick_class_and_scale(self, inst, rec, chessboard):
+    def _pick_class_and_scale(self, inst, rec, chessboard, scale_mode: str = "auto"):
         """Decide on (class, cm/px) using all evidence.
 
         Strategy:
@@ -278,7 +395,7 @@ class FoodVolumePipeline:
 
         def evaluate(label):
             info = nutrition.lookup(label)
-            if chessboard is not None:
+            if chessboard is not None and scale_mode != "class_prior":
                 cm_per_px = chessboard.cm_per_px
                 scale_src = "chessboard"
             else:
@@ -309,12 +426,7 @@ class FoodVolumePipeline:
     @staticmethod
     def _raw_mass(info, area_cm2: float) -> float:
         """The 'before-clamp' mass estimate for one (class, area)."""
-        if info.mass_per_cm2 is not None:
-            return float(info.mass_per_cm2 * area_cm2)
-        if info.typical_mass_g is not None:
-            typical_area = (info.typical_long_cm or 10.0) ** 2 * 0.59
-            return float(info.typical_mass_g * (area_cm2 / typical_area))
-        return float(info.density_g_per_ml * 100.0 * area_cm2 / 50.0)
+        return area_mass_prior(info, area_cm2)
 
     @staticmethod
     def _quantity_confidence(*, clip_score, raw_mass, lo, hi, typical,
@@ -366,14 +478,3 @@ class FoodVolumePipeline:
             if not duplicate:
                 kept.append((inst, rec))
         return kept
-
-    @staticmethod
-    def _geometric_height_prior(area_cm2: float) -> float:
-        """Fallback height (cm) when neither a side view nor a class prior is available.
-
-        Assumes a round-ish object: takes the footprint's equivalent radius and uses a
-        fraction of it (clamped to a plausible range). For non-round dishes (pizza,
-        soup, …) the class-specific prior in the nutrition table takes precedence.
-        """
-        radius_cm = float(np.sqrt(max(area_cm2, 1e-3) / np.pi))
-        return float(np.clip(0.8 * radius_cm, 0.5, 6.0))
