@@ -11,6 +11,7 @@ is filtered out, leaving only the food.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,6 +37,29 @@ class InstanceMask:
         x0, y0 = max(0, x - pad), max(0, y - pad)
         x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
         return image[y0:y1, x0:x1]
+
+    def masked_crop(
+        self,
+        image: np.ndarray,
+        pad: int = 8,
+        background: int = 224,
+    ) -> np.ndarray:
+        """Return the candidate pixels without neighbouring objects.
+
+        A rectangular crop around a small leaf attached to an apple contains a
+        substantial amount of apple, so CLIP can correctly describe the crop as
+        an apple even though FastSAM isolated the leaf.  Neutralising pixels
+        outside this instance mask makes recognition consume the segmentation
+        result instead of merely its bounding box.
+        """
+        h, w = image.shape[:2]
+        x, y, bw, bh = self.bbox
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        crop = image[y0:y1, x0:x1].copy()
+        local_mask = self.mask[y0:y1, x0:x1]
+        crop[~local_mask] = np.uint8(np.clip(background, 0, 255))
+        return crop
 
 
 def _mask_to_instance(mask: np.ndarray) -> Optional[InstanceMask]:
@@ -72,19 +96,29 @@ class FoodSegmenter:
         self.device = device or config.get_device()
         self._model = None
         self.backend = "fastsam"
+        self._load_lock = threading.RLock()
+        self._inference_lock = threading.Lock()
 
     def _ensure_model(self) -> bool:
         """Load FastSAM on first use. Returns False if unavailable (use fallback)."""
         if self._model is not None:
             return True
-        try:
-            from ultralytics import FastSAM
-            self._model = FastSAM(_ensure_weights(self.weights))
-            return True
-        except Exception as exc:  # network/weights/runtime issue -> classical fallback
-            print(f"[segmentation] FastSAM unavailable ({exc}); using classical fallback.")
-            self.backend = "classical"
-            return False
+        load_lock = getattr(self, "_load_lock", None)
+        if load_lock is None:
+            self._load_lock = threading.RLock()
+            load_lock = self._load_lock
+        with load_lock:
+            if self._model is not None:
+                return True
+            try:
+                from ultralytics import FastSAM
+                model = FastSAM(_ensure_weights(self.weights))
+                self._model = model
+                return True
+            except Exception as exc:  # network/weights/runtime issue -> classical fallback
+                print(f"[segmentation] FastSAM unavailable ({exc}); using classical fallback.")
+                self.backend = "classical"
+                return False
 
     # --- public API ------------------------------------------------------------
     def segment(
@@ -106,7 +140,18 @@ class FoodSegmenter:
             ``max_area_frac`` removes the plate/background; ``min_area_frac`` removes noise.
         """
         if self._ensure_model():
-            raw = self._segment_fastsam(image_bgr)
+            inference_lock = getattr(self, "_inference_lock", None)
+            if inference_lock is None:
+                self._inference_lock = threading.Lock()
+                inference_lock = self._inference_lock
+            with inference_lock:
+                raw = self._segment_fastsam(image_bgr)
+            if self.device == "mps":
+                try:
+                    import torch
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
         else:
             raw = self._segment_classical(image_bgr, interior_mask)
 
@@ -152,7 +197,18 @@ class FoodSegmenter:
 
         local: Optional[np.ndarray] = None
         if self._ensure_model():
-            masks = self._segment_fastsam(crop)
+            inference_lock = getattr(self, "_inference_lock", None)
+            if inference_lock is None:
+                self._inference_lock = threading.Lock()
+                inference_lock = self._inference_lock
+            with inference_lock:
+                masks = self._segment_fastsam(crop)
+            if self.device == "mps":
+                try:
+                    import torch
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
             # The food fills most of the (tight) crop -> the largest mask is the food.
             masks = [m for m in masks if 0.02 < m.mean() < 0.97]
             if masks:
@@ -191,7 +247,7 @@ class FoodSegmenter:
     def _segment_fastsam(self, image_bgr: np.ndarray) -> list[np.ndarray]:
         results = self._model(
             image_bgr, device=self.device, retina_masks=True,
-            conf=0.4, iou=0.9, verbose=False,
+            imgsz=768, max_det=32, conf=0.4, iou=0.9, verbose=False,
         )
         out: list[np.ndarray] = []
         if results and results[0].masks is not None:

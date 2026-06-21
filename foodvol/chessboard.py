@@ -11,7 +11,8 @@ to the class-based self-calibration. The user doesn't have to do anything.
 
 A 7×7-internal-corner board (8×8 squares) is the most common; we try a few
 candidate sizes in case the user prints a slightly different one. Square size
-defaults to 2.0 cm — adjustable in ``app.py``.
+defaults to the app's standard 2.0 cm calibration board. The normal UI needs no
+manual setting; API users may still override it.
 """
 from __future__ import annotations
 

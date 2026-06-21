@@ -10,10 +10,10 @@ Die App hat zwei getrennte Mengenpfade:
 
 | Situation | Methode | Ergebnis |
 |---|---|---|
-| Top- und Seitenbild vorhanden | `area_cm2 + height_cm -> volume_ml` | echte Volumenschaetzung |
+| Top- und Seitenbild vorhanden | Top-/Side-Silhouetten -> elliptische Querschnitte -> `volume_ml` | formbewusste Volumenschaetzung |
 | Nur Top-Bild vorhanden | `mass_per_cm2[class] * area_cm2` | Gramm-Fallback, kein echtes Volumen |
 
-Das ist wichtig: Ohne Hoehe gibt es keine belastbare Volumenschaetzung. Die App
+Das ist wichtig: Ohne Seitenprofil gibt es keine belastbare Volumenschaetzung. Die App
 bleibt dann nutzbar, markiert den Pfad aber fachlich als Fallback.
 
 ## Schnellstart
@@ -57,7 +57,15 @@ python data/download_ecustfd.py
 python data/download_nutrition5k.py
 ```
 
-## Aktuelles Volumenmodell
+## Volumenpfad und trainierter Fallback
+
+Im Live-Pfad werden die echte Top-Maske und Seiten-Maske entlang ihrer Laengsachse
+ausgerichtet. Pro Position entsteht aus Top-Tiefe und Seiten-Hoehe ein elliptischer
+Querschnitt; deren Integral ergibt das Volumen. Dadurch wird ein runder Apfel nicht
+wie sein Begrenzungsquader behandelt.
+
+Wenn die Silhouetten nicht ausgerichtet werden koennen, bleibt das trainierte Modell
+als Fallback aktiv:
 
 ```text
 artifact: artifacts/volume_model_trained.joblib
@@ -82,8 +90,11 @@ kleines Regressionsmodell.
 |---|---|
 | Detection detail | Grob steuert, wie viele Masken die Segmentierung zulaesst |
 | Food filter | Steuert, wie streng unsichere Food-Kandidaten entfernt werden |
-| Scale | Nutzt automatisch eine Referenz oder einen Food-Groessen-Prior |
-| Reference square | Nur relevant, wenn eine metrische Referenz sichtbar ist |
+
+Die Skalierung hat keinen manuellen App-Regler. Sie kombiniert automatisch eine
+erkannte 2-cm-Quadratreferenz, einen erkannten Standardteller, den Food-
+Groessen-Prior und die Breitenkorrespondenz zwischen Top- und Seitenbild. Stark
+widerspruechliche, schwache Hinweise werden als Ausreisser verworfen.
 
 Details stehen in `ARCHITECTURE.md` und `TRAINING.md`.
 

@@ -3,8 +3,8 @@
 This module is deliberately small and free of image/model loading. The live
 pipeline, notebooks and tests can all use the same rules:
 
-* with a metric side-view height, predict **volume** and convert it to mass via
-  the nutrition-table density;
+* with a reconstructed two-view volume, use it directly and convert it to mass;
+* with only a metric side-view height, use the trained volume-model fallback;
 * without a side view, use the curated per-class ``mass_per_cm2`` prior as a
   clearly labelled fallback;
 * clamp to broad serving-size ranges when the estimate is physically implausible.
@@ -70,12 +70,15 @@ def estimate_quantity(
     height_cm: Optional[float] = None,
     *,
     height_source: str = "none",
+    measured_volume_ml: Optional[float] = None,
+    volume_source: str = "two_view_silhouette",
     clamp: bool = True,
 ) -> QuantityEstimate:
     """Estimate mass and volume for one item.
 
-    ``height_cm`` is the switch: when present, the trained volume model is used.
-    Without it, the result is an area-based mass prior and is labelled as such.
+    A valid ``measured_volume_ml`` takes precedence over the trained model. If no
+    reconstructed volume exists, ``height_cm`` selects the model fallback. Without
+    either, the result is an area-based mass prior and is labelled as such.
     """
     has_height = (
         height_cm is not None
@@ -83,7 +86,18 @@ def estimate_quantity(
         and float(height_cm) > 0
     )
 
-    if has_height:
+    has_measured_volume = (
+        measured_volume_ml is not None
+        and np.isfinite(measured_volume_ml)
+        and float(measured_volume_ml) > 0
+    )
+
+    if has_measured_volume:
+        used_height = float(height_cm) if has_height else float("nan")
+        raw_volume = float(measured_volume_ml)
+        raw_mass = info.mass_from_volume(raw_volume)
+        source = f"{volume_source}:{height_source}"
+    elif has_height:
         used_height = float(height_cm)
         raw_volume = volume_model.predict_volume(area_cm2, used_height)
         raw_mass = info.mass_from_volume(raw_volume)

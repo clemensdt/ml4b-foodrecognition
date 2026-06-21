@@ -51,6 +51,12 @@ def get_device() -> str:
     """
     import torch
 
+    # Leave CPU headroom for the UI and the rest of the machine. Image decoding,
+    # NMS and tensor preparation still use CPU threads even when inference runs on
+    # Apple MPS. The limit can be overridden for dedicated compute machines.
+    thread_limit = max(1, int(os.environ.get("FOODVOL_TORCH_THREADS", "4")))
+    torch.set_num_threads(thread_limit)
+
     if torch.cuda.is_available():
         return "cuda"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -66,6 +72,10 @@ REFERENCE_DIAMETERS_CM = {
     "plate_large": 30.0,
     "coin_ecustfd": 2.5,   # 1-Yuan coin used as the scale reference in ECUSTFD
 }
+
+# Known calibration props used opportunistically by the automatic scale resolver.
+CHESSBOARD_SQUARE_CM = 2.0
+DEFAULT_PLATE_DIAMETER_CM = REFERENCE_DIAMETERS_CM["plate_dinner"]
 
 # Default model identifiers (overridable via the respective module APIs).
 FASTSAM_WEIGHTS = "FastSAM-s.pt"                                  # ultralytics auto-downloads

@@ -23,8 +23,9 @@ region is a single image encode plus a matrix multiply — fast enough for many 
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import cv2
 import numpy as np
@@ -37,7 +38,8 @@ NONFOOD_LABELS = [
     "a checkerboard pattern", "a polka dot mat", "a calibration board",
     "an empty plate", "a plate", "a bowl", "a table surface", "a placemat",
     "a fork", "a knife", "a spoon", "cutlery", "a napkin", "a hand",
-    "fabric", "a wall", "the floor", "plain background",
+    "a leaf attached to fruit", "a fruit stem", "fabric", "a wall",
+    "the floor", "plain background",
 ]
 
 HYPOTHESIS = "a photo of {}."
@@ -96,6 +98,8 @@ class FoodRecognizer:
         self._is_food: np.ndarray = np.array([])
         self.available = True
         self._fallback = None            # FoodClassifier if CLIP unavailable
+        self._load_lock = threading.RLock()
+        self._inference_lock = threading.Lock()
 
     # --- label set -------------------------------------------------------------
     def _build_labels(self) -> tuple[list[str], list[str], np.ndarray]:
@@ -113,33 +117,73 @@ class FoodRecognizer:
         return texts, keys, is_food
 
     def _ensure_model(self) -> bool:
-        if self._model is not None:
+        ready = (
+            self._model is not None
+            and self._processor is not None
+            and self._text_features is not None
+            and bool(self._labels)
+            and self._is_food.size > 0
+        )
+        if ready:
             return True
-        if not self.available:
-            return False
-        try:
-            import torch
-            from transformers import CLIPModel, CLIPProcessor
 
-            self._model = CLIPModel.from_pretrained(self.model_id).to(self.device).eval()
-            self._processor = CLIPProcessor.from_pretrained(self.model_id)
-
-            texts, keys, is_food = self._build_labels()
-            with torch.no_grad():
-                prompts = [HYPOTHESIS.format(t) for t in texts]
-                inputs = self._processor(text=prompts, return_tensors="pt", padding=True).to(self.device)
-                feats = self._embeds(self._model.get_text_features(**inputs))
-                feats = feats / feats.norm(dim=-1, keepdim=True)
-            self._labels = keys
-            self._is_food = is_food
-            self._text_features = feats
-            return True
-        except Exception as exc:
-            print(f"[recognition] CLIP unavailable ({exc}); falling back to the Food-101 classifier "
-                  "(no non-food gate).")
+        # Loading used to assign ``_model`` before ``_processor`` was ready. A
+        # concurrent Streamlit rerun could then observe the half-loaded object and
+        # call ``None`` as a processor. Build everything locally and publish the
+        # complete state only once all pieces are usable.
+        load_lock = getattr(self, "_load_lock", None)
+        if load_lock is None:  # tolerate a cached instance created before this field existed
+            self._load_lock = threading.RLock()
+            load_lock = self._load_lock
+        with load_lock:
+            ready = (
+                self._model is not None
+                and self._processor is not None
+                and self._text_features is not None
+                and bool(self._labels)
+                and self._is_food.size > 0
+            )
+            if ready:
+                return True
+            # Drop a half-loaded model before retrying. On MPS this matters: keeping
+            # the broken model alive while loading another copy can temporarily
+            # double unified-memory pressure.
             self._model = self._processor = self._text_features = None
-            self.available = False
-            return False
+            self._labels = []
+            self._is_food = np.array([])
+            if not self.available:
+                return False
+            if self.device == "mps":
+                try:
+                    import torch
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
+            try:
+                import torch
+                from transformers import CLIPModel, CLIPProcessor
+
+                processor = CLIPProcessor.from_pretrained(self.model_id)
+                model = CLIPModel.from_pretrained(self.model_id).to(self.device).eval()
+                texts, keys, is_food = self._build_labels()
+                with torch.inference_mode():
+                    prompts = [HYPOTHESIS.format(t) for t in texts]
+                    inputs = processor(text=prompts, return_tensors="pt", padding=True).to(self.device)
+                    feats = self._embeds(model.get_text_features(**inputs))
+                    feats = feats / feats.norm(dim=-1, keepdim=True)
+
+                self._model = model
+                self._processor = processor
+                self._labels = keys
+                self._is_food = is_food
+                self._text_features = feats
+                return True
+            except Exception as exc:
+                print(f"[recognition] CLIP unavailable ({exc}); falling back to the Food-101 classifier "
+                      "(no non-food gate).")
+                self._model = self._processor = self._text_features = None
+                self.available = False
+                return False
 
     @staticmethod
     def _embeds(out):
@@ -156,28 +200,57 @@ class FoodRecognizer:
 
     # --- inference -------------------------------------------------------------
     def recognize(self, image: Union[np.ndarray, Image.Image], top_k: int = 5) -> Recognition:
+        return self.recognize_many([image], top_k=top_k)[0]
+
+    def recognize_many(
+        self,
+        images: Sequence[Union[np.ndarray, Image.Image]],
+        top_k: int = 5,
+        batch_size: int = 8,
+    ) -> list[Recognition]:
+        """Recognise regions in small batches instead of one model pass per mask.
+
+        Batching removes most of the overhead that made a single photo trigger
+        dozens of separate CLIP calls. The batch is deliberately small on Apple
+        Silicon so unified memory usage stays bounded.
+        """
+        if not images:
+            return []
         if not self._ensure_model():
-            return self._fallback_recognize(image)
+            return [self._fallback_recognize(image) for image in images]
         import torch
 
-        pil = _to_pil(image)
-        with torch.no_grad():
-            inputs = self._processor(images=pil, return_tensors="pt").to(self.device)
-            feat = self._embeds(self._model.get_image_features(**inputs))
-            feat = feat / feat.norm(dim=-1, keepdim=True)
-            logit_scale = self._model.logit_scale.exp()
-            logits = (logit_scale * feat @ self._text_features.t()).squeeze(0)
-            probs = logits.softmax(dim=-1).detach().cpu().numpy()
+        if self.device == "mps":
+            batch_size = min(batch_size, 4)
+        batch_size = max(1, int(batch_size))
+        inference_lock = getattr(self, "_inference_lock", None)
+        if inference_lock is None:
+            self._inference_lock = threading.Lock()
+            inference_lock = self._inference_lock
 
-        order = np.argsort(probs)[::-1]
-        top = [(self._labels[i], float(probs[i])) for i in order[:top_k]]
-        best = int(order[0])
-        return Recognition(
-            label=self._labels[best] if self._is_food[best] else "unknown",
-            score=float(probs[best]),
-            is_food=bool(self._is_food[best]),
-            top=top,
-        )
+        results: list[Recognition] = []
+        with inference_lock, torch.inference_mode():
+            for start in range(0, len(images), batch_size):
+                pil_batch = [_to_pil(image) for image in images[start:start + batch_size]]
+                inputs = self._processor(images=pil_batch, return_tensors="pt").to(self.device)
+                feats = self._embeds(self._model.get_image_features(**inputs))
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                logits = self._model.logit_scale.exp() * feats @ self._text_features.t()
+                probabilities = logits.softmax(dim=-1).detach().cpu().numpy()
+
+                for probs in probabilities:
+                    order = np.argsort(probs)[::-1]
+                    top = [(self._labels[i], float(probs[i])) for i in order[:top_k]]
+                    best = int(order[0])
+                    results.append(Recognition(
+                        label=self._labels[best] if self._is_food[best] else "unknown",
+                        score=float(probs[best]),
+                        is_food=bool(self._is_food[best]),
+                        top=top,
+                    ))
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        return results
 
     def _fallback_recognize(self, image) -> Recognition:
         """Without CLIP, use the supervised Food-101 classifier (cannot gate non-food)."""

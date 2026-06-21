@@ -44,6 +44,114 @@ class Measurement:
     ok: bool
 
 
+@dataclass(frozen=True)
+class TwoViewVolume:
+    """Shape-aware volume reconstructed from aligned top and side silhouettes."""
+
+    volume_ml: float
+    height_cm: float
+    length_cm: float
+    side_cm_per_px: float
+    scale_source: str
+    axis_cm: np.ndarray
+    top_depth_cm: np.ndarray
+    side_height_cm: np.ndarray
+
+
+def _mask_crop(mask: np.ndarray) -> Optional[np.ndarray]:
+    """Return the tight non-empty crop of a boolean silhouette."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2 or not mask.any():
+        return None
+    ys, xs = np.where(mask)
+    return mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
+def _resample_profile(values: np.ndarray, samples: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == samples:
+        return values
+    old_x = np.linspace(0.0, 1.0, values.size)
+    new_x = (np.arange(samples, dtype=np.float64) + 0.5) / samples
+    return np.interp(new_x, old_x, values)
+
+
+def estimate_two_view_volume(
+    top_mask: np.ndarray,
+    side_mask: np.ndarray,
+    top_cm_per_px: float,
+    *,
+    side_cm_per_px: Optional[float] = None,
+    side_scale_source: Optional[str] = None,
+    samples: int = 128,
+    max_height_cm: float = 12.0,
+) -> Optional[TwoViewVolume]:
+    """Integrate matching top/side silhouettes into a physical volume.
+
+    The top mask supplies object depth ``d(x)`` and the side mask supplies height
+    ``h(x)`` along the same normalised long axis. Each slice is approximated as an
+    ellipse with area ``pi/4 * d(x) * h(x)``. Integrating those slices preserves a
+    round apple as an ellipsoid instead of treating its bounding box as a prism.
+
+    If the side photo has no metric reference, its horizontal scale is inferred by
+    matching the silhouette width to the already-scaled top-view long axis. This is
+    robust to the two photos being taken at different camera distances.
+    """
+    if not np.isfinite(top_cm_per_px) or top_cm_per_px <= 0:
+        return None
+    top = _mask_crop(top_mask)
+    side = _mask_crop(side_mask)
+    if top is None or side is None or min(top.shape) < 2 or min(side.shape) < 2:
+        return None
+
+    # Orient only the top silhouette so its long footprint axis runs left-to-right.
+    # A side image keeps its native horizontal/vertical semantics.
+    if top.shape[0] > top.shape[1]:
+        top = top.T
+
+    top_length_px = float(top.shape[1])
+    side_width_px = float(side.shape[1])
+    if top_length_px < 2 or side_width_px < 2:
+        return None
+    length_cm = top_length_px * float(top_cm_per_px)
+
+    if side_cm_per_px is not None and np.isfinite(side_cm_per_px) and side_cm_per_px > 0:
+        side_scale = float(side_cm_per_px)
+        scale_source = side_scale_source or "side_metric_reference"
+    else:
+        side_scale = length_cm / side_width_px
+        scale_source = "side_width_matched"
+
+    top_depth = _resample_profile(top.sum(axis=0), samples) * float(top_cm_per_px)
+    side_height = _resample_profile(side.sum(axis=0), samples) * side_scale
+    measured_height = float(side_height.max(initial=0.0))
+    if measured_height <= 0:
+        return None
+    if measured_height > max_height_cm:
+        correction = max_height_cm / measured_height
+        side_height *= correction
+        side_scale *= correction
+        measured_height = max_height_cm
+
+    dx_cm = length_cm / samples
+    cross_sections_cm2 = (np.pi / 4.0) * top_depth * side_height
+    volume_ml = float(np.sum(cross_sections_cm2) * dx_cm)  # 1 cm^3 == 1 mL
+    if not np.isfinite(volume_ml) or volume_ml <= 0:
+        return None
+
+    axis_cm = (np.arange(samples, dtype=np.float64) + 0.5) * dx_cm
+    return TwoViewVolume(
+        volume_ml=volume_ml,
+        height_cm=measured_height,
+        length_cm=length_cm,
+        side_cm_per_px=side_scale,
+        scale_source=scale_source,
+        axis_cm=axis_cm,
+        top_depth_cm=top_depth,
+        side_height_cm=side_height,
+    )
+
+
 def measure_footprint_area_cm2(
     image_bgr: np.ndarray,
     food_box: tuple[int, int, int, int],

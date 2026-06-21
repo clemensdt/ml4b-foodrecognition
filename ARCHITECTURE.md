@@ -16,15 +16,20 @@ Top image
   -> area_cm2
 
 Optional side image
-  -> side segmentation
-  -> height_cm
+  -> side segmentation -> side silhouette
 
-area_cm2 + height_cm
-  -> volume model
+top depth profile + side height profile
+  -> aligned elliptical cross-section integration
   -> volume_ml
   -> density lookup
   -> mass_g, kcal, macros
 ```
+
+Ohne metrische Referenz im Seitenbild wird dessen Pixelmassstab nicht aus dem
+Top-Foto kopiert. Stattdessen wird die Silhouettenbreite auf die bereits physisch
+skalierte Laengsachse der Draufsicht abgebildet. Das toleriert unterschiedliche
+Kameraabstaende. Das trainierte Area-/Height-Modell bleibt als Fallback erhalten,
+falls die Profilintegration nicht moeglich ist.
 
 Wenn `height_cm` fehlt:
 
@@ -47,18 +52,15 @@ Dieser zweite Pfad ist ein Gramm-Fallback, keine Volumenschaetzung.
 | `foodvol/training.py` | reproduzierbares Training und Nutrition5k-Auswertung |
 | `foodvol/nutrition.py` | Dichte, Portion-Priors, kcal und Makros |
 
-## Skalierung
+## Automatische Skalierung
 
 Die Pipeline braucht `cm/px`, um Pixel in reale Flaeche umzuwandeln.
 
-| Modus | Verhalten |
-|---|---|
-| Auto | nutzt Referenz, wenn gefunden; sonst Food-Groessen-Prior |
-| Food-size prior | ignoriert Referenz und nutzt typische Klassengroesse |
-| Metric reference | bevorzugt sichtbare Referenz; faellt mit Hinweis zurueck |
-
-Der Referenzwert in der App ist nur relevant, wenn wirklich ein Chessboard oder
-eine vergleichbare metrische Referenz sichtbar ist.
+Die App sammelt alle sichtbaren Skalenhinweise: 2-cm-Kalibrierquadrate, einen von
+CLIP bestaetigten Standardteller, den schwachen Food-Groessen-Prior und die
+Breitenkorrespondenz zwischen Top- und Seitenansicht. Konsistente Hinweise werden
+konfidenzgewichtet fusioniert; starke Widersprueche zum verlaesslichsten Hinweis
+werden verworfen. Deshalb gibt es im normalen UI keinen Scale- oder Square-Regler.
 
 ## App-Regler
 
@@ -66,7 +68,6 @@ eine vergleichbare metrische Referenz sichtbar ist.
 |---|---|
 | Detection detail | mehr/weniger Masken, hilfreich bei hellen Speisen oder unruhigem Hintergrund |
 | Food filter | toleranter oder strenger CLIP-Food-Filter |
-| Scale | Auswahl zwischen Auto, Food-Prior und metrischer Referenz |
 
 Die Regler veraendern echte Pipeline-Parameter. Sie sind bewusst wenige und
 allgemein gehalten, nicht auf einen einzelnen Hintergrundtyp optimiert.
