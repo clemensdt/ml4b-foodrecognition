@@ -10,10 +10,21 @@ macros with an annotated overlay.
 """
 from __future__ import annotations
 
+from io import BytesIO
+
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+try:
+    from pillow_heif import register_heif_opener
+except ImportError:  # pragma: no cover - dependency is listed, but keep startup robust.
+    register_heif_opener = None
+
+if register_heif_opener is not None:
+    register_heif_opener()
 
 from foodvol import config
 from foodvol.pipeline import FoodVolumePipeline, PlateEstimate
@@ -32,6 +43,7 @@ FOOD_FILTERS = {
 
 MAX_ANALYSIS_SIDE_PX = 1024
 ANALYSIS_VERSION = "leaf-aware-mask-v3"
+SUPPORTED_UPLOAD_TYPES = ["jpg", "jpeg", "png", "heic", "heif"]
 
 
 @st.cache_resource(show_spinner="Loading models (first run downloads weights)…")
@@ -72,12 +84,29 @@ def _estimate_safely(
         return PlateEstimate(notes=["The pipeline stopped before producing an estimate."])
 
 
+def _decode_with_pillow(raw: bytes) -> np.ndarray | None:
+    """Fallback decoder for formats OpenCV cannot read, including HEIC/HEIF."""
+    try:
+        with Image.open(BytesIO(raw)) as pil_image:
+            pil_image = ImageOps.exif_transpose(pil_image).convert("RGB")
+            rgb = np.array(pil_image, dtype=np.uint8)
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
 def _read_upload(uploaded) -> np.ndarray:
     """Decode and bound phone-sized uploads before they reach the vision models."""
-    data = np.frombuffer(uploaded.getvalue(), np.uint8)
+    raw = uploaded.getvalue()
+    data = np.frombuffer(raw, np.uint8)
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
-        raise ValueError("The uploaded image could not be decoded.")
+        image = _decode_with_pillow(raw)
+    if image is None:
+        raise ValueError(
+            "The uploaded image could not be decoded. Please upload a valid "
+            "JPEG, PNG, HEIC or HEIF image."
+        )
     height, width = image.shape[:2]
     longest_side = max(height, width)
     if longest_side > MAX_ANALYSIS_SIDE_PX:
@@ -612,7 +641,7 @@ def _render_pipeline_trace() -> None:
                 "Raw volume": f"{item.raw_volume_ml:.1f} mL",
                 "Raw mass": f"{item.raw_mass_g:.1f} g",
                 "Final mass": f"{item.mass_g:.1f} g",
-                "Plausible range": f"{item.mass_range_g[0]:.0f}–{item.mass_range_g[1]:.0f} g",
+                "Typical range": f"{item.mass_range_g[0]:.0f}–{item.mass_range_g[1]:.0f} g",
             } for item in result.items])
             st.dataframe(quantity_table, use_container_width=True, hide_index=True)
             st.caption("Only the dominant top-view food item is paired with an unlabelled side photo. Other items use the top-view fallback.")
@@ -800,12 +829,18 @@ with analyse_tab:
     side_bgr: np.ndarray | None = None
 
     c1, c2 = st.columns(2)
-    top_file = c1.file_uploader("Top-down photo (required)", type=["jpg", "jpeg", "png"])
-    side_file = c2.file_uploader("Side photo (optional)", type=["jpg", "jpeg", "png"])
+    top_file = c1.file_uploader("Top-down photo (required)", type=SUPPORTED_UPLOAD_TYPES)
+    side_file = c2.file_uploader("Side photo (optional)", type=SUPPORTED_UPLOAD_TYPES)
     if top_file is not None:
-        top_bgr = _read_upload(top_file)
+        try:
+            top_bgr = _read_upload(top_file)
+        except ValueError as exc:
+            c1.error(str(exc))
     if side_file is not None:
-        side_bgr = _read_upload(side_file)
+        try:
+            side_bgr = _read_upload(side_file)
+        except ValueError as exc:
+            c2.error(str(exc))
 
     # --- Run -------------------------------------------------------------------
     if top_bgr is not None and st.button("Estimate", type="primary"):
@@ -861,7 +896,7 @@ with analyse_tab:
                 "Height (cm)": None if np.isnan(it.height_cm) else round(it.height_cm, 1),
                 "Volume (mL)": round(it.volume_ml, 0),
                 "Mass (g)": round(it.mass_g, 0),
-                "Plausible range": _range(it),
+                "Typical range": _range(it),
                 "Scale": it.scale_source,
                 "Quantity source": it.mass_source,
                 "Calories (kcal)": round(it.nutrition.kcal, 0),

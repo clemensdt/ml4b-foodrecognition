@@ -25,8 +25,8 @@ import numpy as np
 
 from . import config, nutrition
 from .nutrition import NutritionEstimate
-from .portion import area_mass_prior, estimate_quantity
-from .recognition import FoodRecognizer, Recognition
+from .portion import HARD_PLAUSIBILITY_FACTOR, area_mass_prior, estimate_quantity
+from .recognition import FoodRecognizer, Recognition, nonfood_kind
 from .segmentation import FoodSegmenter, InstanceMask, _mask_to_instance
 from .volume import TwoViewVolume, VolumeEstimator, estimate_two_view_volume
 
@@ -34,6 +34,8 @@ ImageInput = Union[str, Path, np.ndarray]
 
 MAX_SEGMENTS = 24        # hard cap: keep interactive inference within a bounded cost
 MAX_HEIGHT_CM = 12.0     # clamp measured side-view height to a plausible range
+CONTAINMENT_AREA_RATIO = 2.2
+CONTAINMENT_SCORE_MARGIN = 0.18
 
 SEGMENTATION_PRESETS = {
     "conservative": {"min_area_frac": 0.008, "max_area_frac": 0.80, "max_segments": 8},
@@ -261,6 +263,7 @@ class FoodVolumePipeline:
         crops = [inst.masked_crop(top) for inst in segments]
         recognitions = self.recognizer.recognize_many(crops, batch_size=8)
         for index, (inst, rec) in enumerate(zip(segments, recognitions), start=1):
+            rec = self._promote_large_food_part_alternative(inst, rec, top.shape[:2])
             passed_filter = rec.is_food and rec.score >= min_confidence
             visible_label = rec.label if rec.is_food else (rec.top[0][0] if rec.top else "non-food")
             trace = RegionTrace(
@@ -368,9 +371,10 @@ class FoodVolumePipeline:
 
         # 3 + 4. For each item: self-calibrate, choose class, estimate quantity.
         for inst, original_inst, rec in measurement_kept:
-            # Try the top-1 class; if its plausible range can't contain the measurement,
-            # re-evaluate the same area against every food candidate in CLIP's top-k
-            # and prefer one whose plausible range *does* contain the raw estimate.
+            # Try the top-1 food class; if its plausible range can't contain the
+            # measurement, re-evaluate the same area against CLIP's other food
+            # candidates. Non-food sentinels are allowed to reject/carve masks,
+            # but must never become final nutrition items.
             chosen_label, chosen_info, cm_per_px, scale_src, area_cm2, raw_mass, \
                 was_reranked, scale_evidence = self._pick_class_and_scale(
                     inst,
@@ -410,6 +414,7 @@ class FoodVolumePipeline:
                 height_cm=height_cm,
                 height_source=height_src,
                 measured_volume_ml=two_view.volume_ml if two_view is not None else None,
+                hard_factor=self._hard_plausibility_factor(scale_src, height_src),
             )
             if height_src != "none":
                 result.height_source = height_src
@@ -426,7 +431,11 @@ class FoodVolumePipeline:
                 food_class=chosen_label, confidence=rec.score, area_cm2=area_cm2,
                 height_cm=qty.height_cm, volume_ml=qty.volume_ml,
                 nutrition=info.for_mass(qty.mass_g), mask=inst,
-                alternatives=[(l, s) for l, s in rec.top if l != chosen_label][:3],
+                alternatives=[
+                    (l, s)
+                    for l, s in self._food_rerank_candidates(rec)
+                    if l != chosen_label
+                ][:3],
             )
             item.scale_source = f"reranked:{scale_src}" if was_reranked else scale_src
             item.height_source = height_src
@@ -453,8 +462,15 @@ class FoodVolumePipeline:
                 )
             if qty.clamped:
                 result.notes.append(
-                    f"{chosen_label}: raw estimate {qty.raw_mass_g:.0f} g was outside the "
-                    f"plausible range ({lo:.0f}-{hi:.0f} g); clamped to {qty.mass_g:.0f} g."
+                    f"{chosen_label}: raw estimate {qty.raw_mass_g:.0f} g was far outside "
+                    f"the typical range ({lo:.0f}-{hi:.0f} g); capped to "
+                    f"{qty.mass_g:.0f} g."
+                )
+            elif not self._mass_in_plausible_range(qty.raw_mass_g, lo, hi):
+                result.notes.append(
+                    f"{chosen_label}: raw estimate {qty.raw_mass_g:.0f} g is outside "
+                    f"the typical range ({lo:.0f}-{hi:.0f} g); keeping it as a "
+                    "large/small portion rather than snapping to the range."
                 )
 
         if not result.items:
@@ -514,6 +530,68 @@ class FoodVolumePipeline:
             if not trace.is_food and "plate" in trace.label.lower():
                 return True
         return False
+
+    @staticmethod
+    def _mass_in_plausible_range(mass_g: float, lo: float, hi: float) -> bool:
+        if mass_g < lo:
+            return False
+        if np.isfinite(hi) and mass_g > hi:
+            return False
+        return True
+
+    @staticmethod
+    def _hard_plausibility_factor(
+        scale_src: str,
+        height_src: str,
+    ) -> float:
+        weak_top_only_scale = (
+            height_src == "none"
+            and ("class_prior" in scale_src or scale_src == "fallback")
+        )
+        if weak_top_only_scale:
+            return 1.0
+        return HARD_PLAUSIBILITY_FACTOR
+
+    @staticmethod
+    def _promote_large_food_part_alternative(
+        inst: InstanceMask,
+        rec: Recognition,
+        image_shape: tuple[int, int],
+    ) -> Recognition:
+        """Promote strong food alternatives only for large regions gated as food parts."""
+        if rec.is_food or not rec.food_top:
+            return rec
+
+        nonfood_label = rec.nonfood_label or (rec.top[0][0] if rec.top else "")
+        if nonfood_kind(nonfood_label) != "food_part":
+            return rec
+
+        h, w = image_shape
+        image_area = max(float(h * w), 1.0)
+        area_frac = inst.area_px / image_area
+        _, _, bw, bh = inst.bbox
+        large_region = area_frac >= 0.025 and max(bw, bh) >= 0.16 * min(h, w)
+        if not large_region:
+            return rec
+
+        food_top = rec.food_top or [
+            (label, score)
+            for label, score in rec.top
+            if label in nutrition.known_classes()
+        ]
+        for label, score in food_top:
+            close_to_sentinel = score >= 0.20 and score >= 0.60 * rec.score
+            if close_to_sentinel:
+                return Recognition(
+                    label=label,
+                    score=score,
+                    is_food=True,
+                    top=rec.top,
+                    food_top=rec.food_top,
+                    nonfood_top=rec.nonfood_top,
+                    nonfood_label=nonfood_label,
+                )
+        return rec
 
     @classmethod
     def _fused_item_scale(
@@ -689,6 +767,7 @@ class FoodVolumePipeline:
         traces: list[RegionTrace] = []
         candidates: list[tuple[InstanceMask, Recognition]] = []
         for index, (inst, rec) in enumerate(zip(segments, recognitions), start=1):
+            rec = self._promote_large_food_part_alternative(inst, rec, side_bgr.shape[:2])
             passed = rec.is_food and rec.score >= min_confidence
             visible_label = rec.label if rec.is_food else (rec.top[0][0] if rec.top else "non-food")
             trace = RegionTrace(
@@ -809,24 +888,25 @@ class FoodVolumePipeline:
            else fall back to the recognised class's typical_long_cm.
         2. Compute raw_mass = mass_per_cm2[top-1] × area_cm2.
         3. If raw_mass fits the top-1 plausible [min, max] range → keep top-1.
-        4. Otherwise look through CLIP's other top-k candidates. If one of them
+        4. Otherwise look through CLIP's other food candidates. If one of them
            has a plausible range that *contains* the raw_mass (re-scaled to its
-           own areal density), pick it. This is what saves a Muffin from being
-           called a Blueberry: when the recognised "blueberry" range [1,2]g can
-           never explain a 30 cm² object, but "cupcakes" [60,180]g can.
-        5. If no candidate fits, keep top-1 and let the clamp + warning fire.
+           own areal density), pick it. Explicit non-food sentinels are ignored
+           here; they can reject/carve masks, but never become nutrition items.
+        5. If no candidate fits, keep top-1 and let the soft range warning/cap
+           fire later.
         """
-        candidates = [(rec.label, rec.score)] + [(l, s) for l, s in rec.top if l != rec.label]
-        candidates = candidates[:5]   # at most 5 candidates
+        candidates = self._food_rerank_candidates(rec)
+        if not candidates:
+            candidates = [(rec.label, rec.score)]
 
-        def evaluate(label):
+        def evaluate(label, forced_scale_mode: Optional[str] = None):
             info = nutrition.lookup(label)
             cm_per_px, scale_src, scale_evidence = self._fused_item_scale(
                 inst,
                 info,
                 chessboard,
                 plate_calibration,
-                scale_mode,
+                forced_scale_mode or scale_mode,
             )
             area_cm2 = (cm_per_px ** 2) * inst.area_px
             raw_mass = self._raw_mass(info, area_cm2)
@@ -837,6 +917,12 @@ class FoodVolumePipeline:
         info, cm_per_px, scale_src, area_cm2, raw_mass, scale_evidence = evaluate(top_label)
         lo = info.mass_min_g if info.mass_min_g is not None else 0.0
         hi = info.mass_max_g if info.mass_max_g is not None else float("inf")
+        if "plate" in scale_src and "chessboard" not in scale_src and not (lo <= raw_mass <= hi):
+            c_info, c_cm, c_src, c_area, c_mass, c_evidence = evaluate(top_label, "class_prior")
+            c_lo = c_info.mass_min_g if c_info.mass_min_g is not None else 0.0
+            c_hi = c_info.mass_max_g if c_info.mass_max_g is not None else float("inf")
+            if self._mass_in_plausible_range(c_mass, c_lo, c_hi):
+                return top_label, c_info, c_cm, c_src, c_area, c_mass, False, c_evidence
         if lo <= raw_mass <= hi:
             return top_label, info, cm_per_px, scale_src, area_cm2, raw_mass, False, scale_evidence
 
@@ -848,12 +934,32 @@ class FoodVolumePipeline:
             if a_lo <= a_mass <= a_hi:
                 return alt_label, a_info, a_cm, a_src, a_area, a_mass, True, a_evidence
 
-        # No candidate fits; stay with top-1 and let the clamp fire.
+        # No candidate fits; stay with top-1 and let the soft range logic fire.
         return top_label, info, cm_per_px, scale_src, area_cm2, raw_mass, False, scale_evidence
 
     @staticmethod
+    def _food_rerank_candidates(rec: Recognition) -> list[tuple[str, float]]:
+        """Return CLIP alternatives that can legally become nutrition items."""
+        known_food = set(nutrition.known_classes())
+        candidates: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        food_top = rec.food_top or rec.top
+        for label, score in [(rec.label, rec.score), *food_top]:
+            if label in known_food and label not in seen:
+                candidates.append((label, score))
+                seen.add(label)
+            if len(candidates) >= 5:
+                break
+        if not candidates and rec.is_food:
+            # The fallback Food-101 classifier may emit a label missing from the
+            # local nutrition table. Keep that legacy path, but never admit CLIP's
+            # explicit non-food sentinels into re-ranking.
+            candidates.append((rec.label, rec.score))
+        return candidates
+
+    @staticmethod
     def _raw_mass(info, area_cm2: float) -> float:
-        """The 'before-clamp' mass estimate for one (class, area)."""
+        """The before-bound mass estimate for one (class, area)."""
         return area_mass_prior(info, area_cm2)
 
     @staticmethod
@@ -863,7 +969,7 @@ class FoodVolumePipeline:
 
         Combines:
         - CLIP score (how sure is the recogniser about *some* class)
-        - Plausibility: did the raw estimate fall inside the plausible range,
+        - Plausibility: did the raw estimate fall inside the typical range,
           and how close was it to the class's typical value
         - Scale source: a chessboard scale is much more trustworthy than a
           class-prior scale (which is just a guess about typical size)
@@ -878,7 +984,7 @@ class FoodVolumePipeline:
             dist = abs(raw_mass - typical) / band
             plaus = float(np.clip(1.0 - 0.6 * dist, 0.3, 1.0))
         else:
-            plaus = 0.15   # clamped — we know the answer is wrong, just bounded
+            plaus = 0.15   # outside the typical range; keep/cap it with low confidence
 
         if "chessboard" in scale_src:
             scale_factor = 1.0
@@ -897,7 +1003,7 @@ class FoodVolumePipeline:
 
     @staticmethod
     def _suppress_nested(candidates, containment_thresh: float = 0.6):
-        """Greedy NMS by containment: keep higher-scoring masks, drop ones they overlap.
+        """Greedy NMS by containment: keep the most credible mask per object.
 
         Two masks of the same physical item (e.g. the apple and the apple+plate region)
         overlap heavily even if their IoU is low, so we compare against the smaller mask.
@@ -910,20 +1016,30 @@ class FoodVolumePipeline:
         # larger, it is an object part, not the apple instance. This pre-pass is
         # deliberately narrow: the normal tighter-mask/high-score rule below still
         # wins for apple-vs-apple+plate candidates of comparable scale.
-        tiny_parts: set[int] = set()
+        drops: set[int] = set()
         for index, (inst, rec) in enumerate(candidates):
             for other_index, (other_inst, other_rec) in enumerate(candidates):
-                if index == other_index or rec.label != other_rec.label:
-                    continue
-                if inst.area_px >= 0.18 * other_inst.area_px:
+                if index == other_index:
                     continue
                 overlap = int(np.count_nonzero(inst.mask & other_inst.mask))
-                if overlap / max(inst.area_px, 1) > containment_thresh:
-                    tiny_parts.add(index)
+                if overlap / max(inst.area_px, 1) <= containment_thresh:
+                    continue
+                area_ratio = other_inst.area_px / max(inst.area_px, 1)
+                if rec.label == other_rec.label and area_ratio >= 5.5 and inst.area_px < 0.18 * other_inst.area_px:
+                    drops.add(index)
                     break
+                if area_ratio >= CONTAINMENT_AREA_RATIO:
+                    broad_context = FoodVolumePipeline._nonfood_context_score(
+                        other_rec,
+                        {"container", "surface", "background"},
+                    )
+                    broad_is_ambiguous_context = broad_context >= 0.45 * max(other_rec.score, 1e-9)
+                    broad_not_decisive = other_rec.score <= rec.score + CONTAINMENT_SCORE_MARGIN
+                    if broad_is_ambiguous_context or broad_not_decisive:
+                        drops.add(other_index)
         candidates = [
             candidate for index, candidate in enumerate(candidates)
-            if index not in tiny_parts
+            if index not in drops
         ]
 
         candidates = sorted(candidates, key=lambda c: c[1].score, reverse=True)
@@ -938,3 +1054,11 @@ class FoodVolumePipeline:
             if not duplicate:
                 kept.append((inst, rec))
         return kept
+
+    @staticmethod
+    def _nonfood_context_score(rec: Recognition, kinds: set[str]) -> float:
+        labels = rec.nonfood_top or rec.top
+        return max(
+            (score for label, score in labels if nonfood_kind(label) in kinds),
+            default=0.0,
+        )

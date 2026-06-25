@@ -24,7 +24,7 @@ region is a single image encode plus a matrix multiply — fast enough for many 
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence, Union
 
 import cv2
@@ -33,14 +33,36 @@ from PIL import Image
 
 from . import config, nutrition
 
-# Non-food labels used purely as a gate. If one of these wins, the region is not food.
-NONFOOD_LABELS = [
-    "a checkerboard pattern", "a polka dot mat", "a calibration board",
-    "an empty plate", "a plate", "a bowl", "a table surface", "a placemat",
-    "a fork", "a knife", "a spoon", "cutlery", "a napkin", "a hand",
-    "a leaf attached to fruit", "a fruit stem", "fabric", "a wall",
-    "the floor", "plain background",
-]
+# Non-food labels used purely as a gate. Kinds let the pipeline make generic
+# geometry decisions without singling out one photographed object.
+NONFOOD_LABEL_KINDS = {
+    "a checkerboard pattern": "calibration",
+    "a polka dot mat": "surface",
+    "a calibration board": "calibration",
+    "an empty plate": "container",
+    "a plate": "container",
+    "a bowl": "container",
+    "a table surface": "surface",
+    "a placemat": "surface",
+    "a fork": "utensil",
+    "a knife": "utensil",
+    "a spoon": "utensil",
+    "cutlery": "utensil",
+    "a napkin": "surface",
+    "a hand": "person",
+    "a leaf attached to fruit": "food_part",
+    "a fruit stem": "food_part",
+    "fabric": "surface",
+    "a wall": "background",
+    "the floor": "background",
+    "plain background": "background",
+}
+NONFOOD_LABELS = list(NONFOOD_LABEL_KINDS)
+
+
+def nonfood_kind(label: str) -> str:
+    """Return the semantic kind for a non-food sentinel label."""
+    return NONFOOD_LABEL_KINDS.get(label, "")
 
 HYPOTHESIS = "a photo of {}."
 
@@ -75,6 +97,9 @@ class Recognition:
     score: float        # probability of the winning label
     is_food: bool
     top: list[tuple[str, float]]  # top-k (label, score) for transparency
+    food_top: list[tuple[str, float]] = field(default_factory=list)
+    nonfood_top: list[tuple[str, float]] = field(default_factory=list)
+    nonfood_label: str = ""
 
 
 def _to_pil(image: Union[np.ndarray, Image.Image]) -> Image.Image:
@@ -242,11 +267,25 @@ class FoodRecognizer:
                     order = np.argsort(probs)[::-1]
                     top = [(self._labels[i], float(probs[i])) for i in order[:top_k]]
                     best = int(order[0])
+                    food_top = [
+                        (self._labels[i], float(probs[i]))
+                        for i in order
+                        if self._is_food[i]
+                    ][:top_k]
+                    nonfood_top = [
+                        (self._labels[i], float(probs[i]))
+                        for i in order
+                        if not self._is_food[i]
+                    ][:top_k]
+                    is_food = bool(self._is_food[best])
                     results.append(Recognition(
-                        label=self._labels[best] if self._is_food[best] else "unknown",
+                        label=self._labels[best] if is_food else "unknown",
                         score=float(probs[best]),
-                        is_food=bool(self._is_food[best]),
+                        is_food=is_food,
                         top=top,
+                        food_top=food_top,
+                        nonfood_top=nonfood_top,
+                        nonfood_label="" if is_food else self._labels[best],
                     ))
         if self.device == "mps":
             torch.mps.empty_cache()
@@ -259,4 +298,5 @@ class FoodRecognizer:
             self._fallback = FoodClassifier(device=self.device)
         pred = self._fallback.classify_top1(image)
         return Recognition(label=pred.label, score=pred.score, is_food=True,
-                           top=[(pred.label, pred.score)])
+                           top=[(pred.label, pred.score)],
+                           food_top=[(pred.label, pred.score)])

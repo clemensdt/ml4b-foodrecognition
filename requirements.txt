@@ -9,6 +9,7 @@ scikit-learn
 pandas
 matplotlib
 pillow
+pillow-heif
 opencv-python
 
 # --- Deep learning (CPU / Apple-MPS / CUDA) ---

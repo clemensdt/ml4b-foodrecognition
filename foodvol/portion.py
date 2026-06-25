@@ -7,7 +7,7 @@ pipeline, notebooks and tests can all use the same rules:
 * with only a metric side-view height, use the trained volume-model fallback;
 * without a side view, use the curated per-class ``mass_per_cm2`` prior as a
   clearly labelled fallback;
-* clamp to broad serving-size ranges when the estimate is physically implausible.
+* keep unusual-but-possible serving sizes, and only cap extreme outliers.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ import numpy as np
 
 from .nutrition import NutritionInfo
 from .volume import VolumeEstimator
+
+HARD_PLAUSIBILITY_FACTOR = 4.0
 
 
 @dataclass(frozen=True)
@@ -50,16 +52,21 @@ def area_mass_prior(info: NutritionInfo, area_cm2: float) -> float:
     return float(info.density_g_per_ml * 100.0 * area_cm2 / 50.0)
 
 
-def _clamp_mass(
+def _bound_mass(
     mass_g: float,
     info: NutritionInfo,
+    *,
+    hard_factor: float = HARD_PLAUSIBILITY_FACTOR,
 ) -> tuple[float, bool, Optional[str]]:
     lo = info.mass_min_g if info.mass_min_g is not None else 0.0
     hi = info.mass_max_g if info.mass_max_g is not None else float("inf")
-    if mass_g < lo:
-        return float(lo), True, "min"
-    if mass_g > hi:
-        return float(hi), True, "max"
+    factor = max(1.0, float(hard_factor))
+    hard_lo = lo / factor if lo > 0 else lo
+    hard_hi = hi * factor if np.isfinite(hi) else hi
+    if mass_g < hard_lo:
+        return float(hard_lo), True, "min"
+    if mass_g > hard_hi:
+        return float(hard_hi), True, "max"
     return float(mass_g), False, None
 
 
@@ -73,6 +80,7 @@ def estimate_quantity(
     measured_volume_ml: Optional[float] = None,
     volume_source: str = "two_view_silhouette",
     clamp: bool = True,
+    hard_factor: float = HARD_PLAUSIBILITY_FACTOR,
 ) -> QuantityEstimate:
     """Estimate mass and volume for one item.
 
@@ -108,7 +116,10 @@ def estimate_quantity(
         raw_volume = raw_mass / info.density_g_per_ml if info.density_g_per_ml else float("nan")
         source = "area_mass_prior"
 
-    mass, clamped, bound = _clamp_mass(raw_mass, info) if clamp else (raw_mass, False, None)
+    mass, clamped, bound = (
+        _bound_mass(raw_mass, info, hard_factor=hard_factor)
+        if clamp else (raw_mass, False, None)
+    )
     volume = mass / info.density_g_per_ml if info.density_g_per_ml else raw_volume
     if clamped:
         source = f"{source}:clamped_{bound}"
