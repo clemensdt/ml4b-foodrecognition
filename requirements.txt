@@ -10,7 +10,7 @@ pandas
 matplotlib
 pillow
 pillow-heif
-opencv-python
+opencv-python-headless   # headless build: no libGL system lib (required on Streamlit Cloud)
 
 # --- Deep learning (CPU / Apple-MPS / CUDA) ---
 torch>=2.2
