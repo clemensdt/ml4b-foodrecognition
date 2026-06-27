@@ -10,7 +10,10 @@ pandas
 matplotlib
 pillow
 pillow-heif
-opencv-python-headless   # headless build: no libGL system lib (required on Streamlit Cloud)
+# ultralytics depends on (non-headless) opencv-python; pin the SAME distribution so
+# only one cv2 is installed. Two opencv packages collide under uv and break `import cv2`.
+# The libGL/glib system libs it needs are provided via packages.txt (Streamlit Cloud).
+opencv-python
 
 # --- Deep learning (CPU / Apple-MPS / CUDA) ---
 torch>=2.2
